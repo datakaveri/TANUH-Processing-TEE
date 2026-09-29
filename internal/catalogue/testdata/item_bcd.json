@@ -1,0 +1,111 @@
+{
+ "result": [
+  {
+   "id": "e59526dd-5188-47dd-a270-eb5bb597162c",
+   "name": "Breast Cancer Density Benchmark (Prefilled Demo)",
+   "primaryMetric": "macro_f1",
+   "secondaryMetric": "qwk_quadratic_weight_kappa",
+   "datasetMetrics": {
+    "modality": "DICOM mammography (grayscale)",
+    "volume": "200 patient records",
+    "output": {
+     "dataType": "Ordinal 4-class breast density label",
+     "format": "Excel / CSV (mammogram_benchmark_labels.xlsx)",
+     "maxFileSize": "\u22645 MB",
+     "columns": [
+      "new_file_path",
+      "tissueden"
+     ],
+     "description": "tissueden is an integer 0\u20133 where A=0, B=1, C=2, D=3. Each record links a DICOM mammogram to its radiologist-assigned BI-RADS density category."
+    },
+    "primaryMetric": "macro_f1",
+    "secondaryMetric": "qwk_quadratic_weight_kappa",
+    "inputDataType": "Single-channel (grayscale) mammography image",
+    "inputSize": "1 DICOM file per subject \u00b7 dimensions vary per study (see DICOM Rows/Columns tags)",
+    "inputMaxFileSize": "\u226450 MB per DICOM file",
+    "inputFormat": "DICOM (.dcm)",
+    "inputOrganization": "Files in mammogram_benchmark/subject_000XX/; ground-truth labels in mammogram_benchmark_labels.xlsx",
+    "inputPreprocessing": "No pre-processing applied.",
+    "outputDataType": "Ordinal 4-class breast density label",
+    "outputFormat": "Excel / CSV (mammogram_benchmark_labels.xlsx)",
+    "outputMaxFileSize": "\u22645 MB",
+    "outputColumns": "new_file_path, tissueden",
+    "outputDescription": "tissueden is an integer 0\u20133 where A=0, B=1, C=2, D=3. Each record links a DICOM mammogram to its radiologist-assigned BI-RADS density category.",
+    "accuracy": 0,
+    "macro_f1": 0,
+    "macro_f2": 0,
+    "weighted_f2": 0,
+    "sensitivity_recall": 0,
+    "specificity_true_negative_rate": 0,
+    "ppv_positive_predictive_value": 0,
+    "npv_negative_predictive_value": 0,
+    "auc_area_under_curve": 0,
+    "qwk_quadratic_weight_kappa": 0,
+    "input": {
+     "dataType": "Single-channel (grayscale) mammography image",
+     "size": "1 DICOM file per subject \u00b7 dimensions vary per study (see DICOM Rows/Columns tags)",
+     "maxFileSize": "\u226450 MB per DICOM file",
+     "format": "DICOM (.dcm)",
+     "organization": "Files in mammogram_benchmark/subject_000XX/; ground-truth labels in mammogram_benchmark_labels.xlsx",
+     "preprocessing": "No pre-processing applied."
+    },
+    "distributions": [
+     {
+      "label": "Computed Radiography",
+      "categories": [
+       {
+        "name": "A",
+        "count": 36,
+        "description": "Almost entirely fatty"
+       },
+       {
+        "name": "B",
+        "count": 39,
+        "description": "Scattered fibroglandular"
+       },
+       {
+        "name": "C",
+        "count": 40,
+        "description": "Heterogeneously dense"
+       },
+       {
+        "name": "D",
+        "count": 9,
+        "description": "Extremely dense"
+       }
+      ],
+      "note": "A: 36 \u00b7 B: 39 \u00b7 C: 40 \u00b7 D: 9 \u00b7 Total: 124",
+      "total": 124
+     },
+     {
+      "label": "DR (Digital Radiography)",
+      "categories": [
+       {
+        "name": "A",
+        "count": 20,
+        "description": "Almost entirely fatty"
+       },
+       {
+        "name": "B",
+        "count": 20,
+        "description": "Scattered fibroglandular"
+       },
+       {
+        "name": "C",
+        "count": 20,
+        "description": "Heterogeneously dense"
+       },
+       {
+        "name": "D",
+        "count": 16,
+        "description": "Extremely dense"
+       }
+      ],
+      "note": "A: 20 \u00b7 B: 20 \u00b7 C: 20 \u00b7 D: 16 \u00b7 Total: 76",
+      "total": 76
+     }
+    ]
+   }
+  }
+ ]
+}

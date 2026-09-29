@@ -4,8 +4,7 @@
 // is the raw concatenation of chunks (each = plaintext + 16-byte GCM tag, no
 // framing); per-chunk IV = base_iv + chunk_index (96-bit big-endian) and AAD =
 // "{i}:{totalChunks}:{fileId}". This is the browser-produced format from ui-dx
-// encrypted-dataset-upload.ts, distinct from the DecryptBlob/DecryptChunkedFile
-// formats in aesgcm.go (which are unchanged).
+// encrypted-dataset-upload.ts.
 package crypto
 
 import (

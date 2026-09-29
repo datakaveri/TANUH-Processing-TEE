@@ -1,0 +1,48 @@
+{
+ "result": [
+  {
+   "id": "99303f17-8be7-421d-9d75-81dd6cdb7c7b",
+   "name": "Glaucoma Detection Benchmark (Prefilled Demo)",
+   "primaryMetric": "f2_score",
+   "secondaryMetric": "ppv_positive_predictive_value",
+   "datasetMetrics": {
+    "modality": "RGB image",
+    "volume": "200 labelled images",
+    "output": {
+     "dataType": "Not specified in reference dataset",
+     "format": "Not specified in reference dataset",
+     "columns": [
+      "Not specified in reference dataset"
+     ],
+     "description": "Not specified in reference dataset"
+    },
+    "primaryMetric": "f2_score",
+    "secondaryMetric": "ppv_positive_predictive_value",
+    "inputDataType": "Not specified in reference dataset",
+    "inputSize": "Not specified in reference dataset",
+    "inputFormat": "Not specified in reference dataset",
+    "inputOrganization": "Not specified in reference dataset",
+    "inputPreprocessing": "Not specified in reference dataset",
+    "outputDataType": "Not specified in reference dataset",
+    "outputFormat": "Not specified in reference dataset",
+    "outputColumns": "Not specified in reference dataset",
+    "outputDescription": "Not specified in reference dataset",
+    "f2_score": 0,
+    "ppv_positive_predictive_value": 0,
+    "sensitivity_recall": 0,
+    "specificity_true_negative_rate": 0,
+    "fnr_false_negative_rate": 0,
+    "fpr_false_positive_rate": 0,
+    "confusion_matrix": 0,
+    "auc_area_under_curve": 0,
+    "input": {
+     "dataType": "Not specified in reference dataset",
+     "size": "Not specified in reference dataset",
+     "format": "Not specified in reference dataset",
+     "organization": "Not specified in reference dataset",
+     "preprocessing": "Not specified in reference dataset"
+    }
+   }
+  }
+ ]
+}

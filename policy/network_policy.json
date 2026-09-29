@@ -22,6 +22,15 @@
     },
 
     {
+      "destination": "cloudkms.googleapis.com",
+      "protocol": "tcp",
+      "ports": [443],
+      "download": "ALLOW",
+      "upload": "DENY",
+      "description": "Allow KMS asymmetricDecrypt to unwrap each dataset file's key"
+    },
+
+    {
       "destination": "storage.googleapis.com",
       "protocol": "tcp",
       "ports": [443],

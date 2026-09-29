@@ -11,24 +11,22 @@ import (
 	"time"
 )
 
-// DepsError reports a failed pre-eval dependency install for a user
-// preprocessing script (dep_scanner.py + uv). Output carries the scanner's
-// stderr tail for classification/logging; it is sanitised before any
-// external reporting.
+// DepsError reports a failed dependency install for the model provider's
+// adaptor script (dep_scanner.py + uv). Output carries the scanner's stderr
+// tail for classification/logging; it is sanitised before any external
+// reporting.
 type DepsError struct {
 	Output string
 }
 
 func (e *DepsError) Error() string {
-	return "installing preprocessing dependencies failed: " + e.Output
+	return "installing adaptor dependencies failed: " + e.Output
 }
 
-// InstallDeps runs dep_scanner.py against the user's preprocessing script:
-// it AST-scans the imports and uv-installs whatever the image doesn't
-// already provide, so the eval subprocess doesn't die on ImportError.
-// The install happens before the eval sandbox launches, matching the
-// latestv7 design — a failed install fails the job with the uv output
-// rather than a confusing ImportError later.
+// InstallDeps runs dep_scanner.py against the adaptor script: it AST-scans
+// the imports and uv-installs whatever the image doesn't already provide, so
+// the adaptor stage doesn't die on ImportError. A failed install fails the job
+// with the uv output rather than a confusing ImportError later.
 func InstallDeps(ctx context.Context, workdir, scannerPath, scriptPath string, timeout time.Duration) error {
 	if timeout > 0 {
 		var cancel context.CancelFunc

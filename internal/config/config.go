@@ -25,10 +25,19 @@ type Config struct {
 	StopZone     string
 	StopInstance string
 
+	// EvaluatorsBucket holds one evaluate.py per problem bucket
+	// (gs://<bucket>/<task_type>/evaluate.py). Deliberately not read from the
+	// environment: whoever launches the VM must not be able to point scoring
+	// at different scripts. Changing it means a new image (and a new digest).
+	EvaluatorsBucket string
+	DecryptWorkers   int // parallel dataset object downloads/decrypts
+
 	IdleTimeout      time.Duration
 	DeallocAfterJob  bool
-	EvalTimeout      time.Duration // 0 disables the timeout
-	DepsTimeout      time.Duration // pre-eval uv install cap; 0 disables
+	InferTimeout     time.Duration // stage timeouts; 0 disables
+	AdaptorTimeout   time.Duration
+	EvaluatorTimeout time.Duration
+	DepsTimeout      time.Duration // adaptor dependency install cap; 0 disables
 	LeaderboardURL   string
 	PolicyPath       string
 	AttestAudience   string // audience for leaderboard attestation claims
@@ -52,10 +61,15 @@ func FromEnv() Config {
 		StopZone:     getEnv("ZONE", "us-central1-a"),
 		StopInstance: getEnv("INSTANCE", "gpu-cs-tdx-h100"),
 
-		IdleTimeout:     secondsEnv("PROCESSING_IDLE_TIMEOUT_SECONDS", 300),
-		DeallocAfterJob: getEnv("PROCESSING_DEALLOCATE_AFTER_JOB", "1") == "1",
-		EvalTimeout:     secondsEnv("PROCESSING_EVAL_TIMEOUT_SECONDS", 3600),
-		DepsTimeout:     secondsEnv("PROCESSING_DEPS_TIMEOUT_SECONDS", 600),
+		EvaluatorsBucket: "tanuh-evaluators",
+		DecryptWorkers:   16,
+
+		IdleTimeout:      secondsEnv("PROCESSING_IDLE_TIMEOUT_SECONDS", 300),
+		DeallocAfterJob:  getEnv("PROCESSING_DEALLOCATE_AFTER_JOB", "1") == "1",
+		InferTimeout:     secondsEnv("PROCESSING_INFER_TIMEOUT_SECONDS", 3600),
+		AdaptorTimeout:   secondsEnv("PROCESSING_ADAPTOR_TIMEOUT_SECONDS", 600),
+		EvaluatorTimeout: secondsEnv("PROCESSING_EVALUATOR_TIMEOUT_SECONDS", 600),
+		DepsTimeout:      secondsEnv("PROCESSING_DEPS_TIMEOUT_SECONDS", 600),
 		LeaderboardURL: getEnv("LEADERBOARD_SUBMIT_URL",
 			"https://benchmark.tanuh.ai/leaderboard/submit-solution"),
 		PolicyPath:       getEnv("NETWORK_POLICY_PATH", base+"/policy/network_policy.json"),

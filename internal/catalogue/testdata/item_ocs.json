@@ -1,0 +1,196 @@
+{
+ "result": [
+  {
+   "id": "d8c50b6b-af58-4f9d-9af8-4d42bfb1c4bb",
+   "name": "Oral Cancer Screening Benchmark (Prefilled Demo)",
+   "primaryMetric": "f2_score",
+   "secondaryMetric": "npv_negative_predictive_value",
+   "datasetMetrics": {
+    "modality": "RGB image",
+    "volume": "127 participants \u00b7 127 images",
+    "output": {
+     "dataType": "Binary classification label",
+     "format": "CSV",
+     "columns": [
+      "Unique_case_ID",
+      "Label"
+     ],
+     "description": "Label is 0 (Non-suspicious) or 1 (Suspicious)."
+    },
+    "primaryMetric": "f2_score",
+    "secondaryMetric": "npv_negative_predictive_value",
+    "inputDataType": "Single RGB 2D intra-oral photograph",
+    "inputSize": "~3\u20135 MB per file \u00b7 3072\u00d73072 px (9.4 MPx)",
+    "inputFormat": "JPG",
+    "inputOrganization": "Two folders by binary class: OCS_Benchmarking/Non-Suspicious and OCS_Benchmarking/Suspicious",
+    "inputPreprocessing": "No additional pre-processing applied to images in the benchmarking dataset.",
+    "outputDataType": "Binary classification label",
+    "outputFormat": "CSV",
+    "outputColumns": "Unique_case_ID, Label",
+    "outputDescription": "Label is 0 (Non-suspicious) or 1 (Suspicious).",
+    "f2_score": 0,
+    "npv_negative_predictive_value": 0,
+    "sensitivity_recall": 0,
+    "specificity_true_negative_rate": 0,
+    "ppv_positive_predictive_value": 0,
+    "input": {
+     "dataType": "Single RGB 2D intra-oral photograph",
+     "size": "~3\u20135 MB per file \u00b7 3072\u00d73072 px (9.4 MPx)",
+     "format": "JPG",
+     "organization": "Two folders by binary class: OCS_Benchmarking/Non-Suspicious and OCS_Benchmarking/Suspicious",
+     "preprocessing": "No additional pre-processing applied to images in the benchmarking dataset."
+    },
+    "distributions": [
+     {
+      "label": "Label",
+      "categories": [
+       {
+        "name": "Non-suspicious",
+        "count": 72
+       },
+       {
+        "name": "Suspicious",
+        "count": 55
+       }
+      ]
+     },
+     {
+      "label": "Sex",
+      "categories": [
+       {
+        "name": "Male",
+        "count": 74
+       },
+       {
+        "name": "Female",
+        "count": 53
+       }
+      ]
+     },
+     {
+      "label": "Study setting",
+      "categories": [
+       {
+        "name": "Field / primary care",
+        "count": 78
+       },
+       {
+        "name": "Hospital",
+        "count": 49
+       }
+      ]
+     },
+     {
+      "label": "Risk habit",
+      "categories": [
+       {
+        "name": "Cigarette / Bidi",
+        "count": 32
+       },
+       {
+        "name": "Smokeless tobacco",
+        "count": 44
+       },
+       {
+        "name": "Areca nut",
+        "count": 33
+       },
+       {
+        "name": "Alcohol",
+        "count": 20
+       }
+      ],
+      "note": "Categories are not mutually exclusive \u2014 participants may report multiple habits."
+     },
+     {
+      "label": "Habit status",
+      "categories": [
+       {
+        "name": "Any habit reported",
+        "count": 98
+       },
+       {
+        "name": "No habit",
+        "count": 29
+       }
+      ]
+     },
+     {
+      "label": "Risk (among suspicious cases)",
+      "categories": [
+       {
+        "name": "High risk",
+        "count": 16
+       },
+       {
+        "name": "Low risk",
+        "count": 39
+       }
+      ]
+     },
+     {
+      "label": "Oral cavity site",
+      "categories": [
+       {
+        "name": "Left buccal mucosa",
+        "count": 31
+       },
+       {
+        "name": "Right buccal mucosa",
+        "count": 28
+       },
+       {
+        "name": "Dorsum of tongue",
+        "count": 14
+       },
+       {
+        "name": "Palate",
+        "count": 11
+       },
+       {
+        "name": "Right margin of tongue",
+        "count": 9
+       },
+       {
+        "name": "Floor of mouth",
+        "count": 8
+       },
+       {
+        "name": "Left margin of tongue",
+        "count": 8
+       },
+       {
+        "name": "Mandibular vestibule",
+        "count": 8
+       },
+       {
+        "name": "Retromolar trigone",
+        "count": 3
+       },
+       {
+        "name": "Maxillary vestibule",
+        "count": 2
+       },
+       {
+        "name": "Right alveolar ridge",
+        "count": 2
+       },
+       {
+        "name": "Gingiva",
+        "count": 1
+       },
+       {
+        "name": "Labial mucosa (lower lip)",
+        "count": 1
+       },
+       {
+        "name": "Labial mucosa (upper lip)",
+        "count": 1
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}

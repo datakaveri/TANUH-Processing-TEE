@@ -1,34 +1,36 @@
-# Python in this image exists ONLY for the evaluation scripts fetched from
-# gs://tanuh-eval-scripts at job time (see Dockerfile). The manager itself is
-# the Go binary — no Flask/web deps belong here.
+# Python in this image runs three stages of each job (see Dockerfile):
+#   /app/infer.py         platform inference — ONNX, TorchScript and Hugging Face runtimes
+#   adaptor.py            the model provider's output adaptor (uploaded per job)
+#   <bucket>/evaluate.py  the bucket's evaluator (fetched per job from the evaluators bucket)
+# The manager itself is the Go binary.
 #
-# numpy pinned <2 — onnxruntime-gpu 1.19.x and torch 2.2.x cu121 wheels are
-# built against the NumPy 1.x ABI.
-numpy>=1.23.2,<2
-scikit-learn>=1.3.0
-# CUDA 12.1 wheels (installed via the cu121 extra-index in the Dockerfile);
-# compatible with the CUDA 12.3 runtime base image and driver 535.
-# The eval scripts themselves import onnx/onnxruntime/cv2/pydicom/PIL/sklearn;
-# torch/torchvision/transformers stay available for user preprocessing.py code.
-torch==2.2.2
-torchvision==0.17.2
-onnx>=1.14.0
+# Versions are pinned to the ones the platform was verified with: the parity
+# runs against the previous evaluators reproduced every model output and metric
+# exactly with these. torch is also the TorchScript contract (a model saved with
+# this torch or older loads); scikit-learn computes every leaderboard metric.
+#
+# numpy stays <2 — onnxruntime-gpu 1.19.x is built against the NumPy 1.x ABI.
+numpy==1.26.4
+scikit-learn==1.9.1
+scipy==1.17.1
 # onnxruntime is installed in the Dockerfile via the ONNXRUNTIME_PKG build ARG
-# (single source, one codebase, two images):
+# (one codebase, two images):
 #   GPU build (default): onnxruntime-gpu==1.19.2 — links libcudart.so.12 /
 #     libcudnn.so.9, matching the CUDA 12.3 + cuDNN 9 base (H100 path).
 #   CPU build:           onnxruntime==1.19.2 — no CUDA provider .so, so it
 #     cannot segfault on a GPU-less VM (CPU fallback path).
-onnxscript>=0.1.0
-pydicom>=2.4.0
-pylibjpeg[all]>=2.0.0
-opencv-python-headless>=4.8.0
-Pillow>=10.0.0
-transformers>=4.35.0
-# Baked-in extras commonly used by user preprocessing scripts. Anything else
-# a preprocessing.py imports is installed at job time by dep_scanner.py + uv
-# (network policy allows pypi.org/files.pythonhosted.org download-only).
-scipy>=1.10.0
-pandas>=2.0.0
-scikit-image>=0.21.0
-einops>=0.7.0
+onnx==1.23.0
+# CUDA 12.1 wheels (installed via the cu121 extra-index in the Dockerfile);
+# compatible with the CUDA 12.3 runtime base image.
+torch==2.5.1
+torchvision==0.20.1
+transformers==4.46.3
+safetensors==0.8.0
+# Decoders: DICOM (incl. JPEG-Lossless mammograms) and images.
+pydicom==3.0.2
+pylibjpeg[all]==2.1.0
+opencv-python-headless==4.11.0.86
+Pillow==12.3.0
+# Convenient for adaptors. Anything else an adaptor imports is installed at
+# job time by dep_scanner.py + uv (network policy allows pypi download-only).
+pandas>=2.0.0,<3

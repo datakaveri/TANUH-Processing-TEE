@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/datakaveri/tanuh-processing-tee/internal/config"
+	"github.com/datakaveri/tanuh-processing-tee/internal/evaluator"
 	"github.com/datakaveri/tanuh-processing-tee/internal/gcp"
 )
 
@@ -31,7 +32,8 @@ type State struct {
 
 // Manager serialises job execution and owns the runtime state.
 type Manager struct {
-	cfg config.Config
+	cfg        config.Config
+	evaluators evaluator.Source // where each bucket's evaluate.py comes from
 
 	mu      sync.Mutex
 	state   State
@@ -42,6 +44,10 @@ type Manager struct {
 func NewManager(cfg config.Config) (*Manager, error) {
 	m := &Manager{
 		cfg: cfg,
+		// Fetched per job from GCS for now; switch to
+		// evaluator.ImageSource{Root: cfg.BaseDir + "/evaluators"} once the
+		// evaluators ship inside the image.
+		evaluators: evaluator.NewGCSSource(cfg.EvaluatorsBucket),
 		state: State{
 			Status:           "waiting_for_job",
 			LastActivityUnix: time.Now().Unix(),

@@ -1,11 +1,14 @@
-# TANUH Processing TEE — single Go binary + Python eval runtime.
+# TANUH Processing TEE — single Go binary + Python stage runtime.
 #
 # The Go binary (processing-tee) owns the whole pipeline: RA-TLS intake,
-# dataset fetch/decrypt, catalogue declaration fetch, leaderboard submission,
-# buffer completion callback, self-deallocation. Python exists in this image
-# ONLY for the platform-owned generic evaluation engine (tools/generic-eval/
-# evaluate.py — onnxruntime + scikit-learn + per-modality decoders), executed
-# as a subprocess.
+# catalogue entry fetch, evaluator fetch, dataset fetch/decrypt, leaderboard
+# submission, buffer completion callback, self-deallocation. Python runs three
+# stages of each job as subprocesses:
+#   /app/infer.py      platform inference: ONNX, TorchScript and Hugging Face
+#                      runtimes + per-modality decoders (tools/infer/infer.py)
+#   adaptor.py         the model provider's output adaptor (uploaded per job)
+#   evaluate.py        the problem bucket's evaluator (fetched per job from
+#                      gs://tanuh-evaluators/<bucket>/evaluate.py)
 FROM golang:1.26-bookworm AS go-builder
 WORKDIR /src
 COPY go.mod ./
@@ -29,6 +32,9 @@ ENV PYTHONUNBUFFERED=1 \
     NVIDIA_VISIBLE_DEVICES=none \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     CUDA_VISIBLE_DEVICES=-1 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
     LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib
 
 WORKDIR /app
@@ -72,21 +78,22 @@ RUN python -m pip install --upgrade pip \
         "$ONNXRUNTIME_PKG"
 
 # UV — used at job time by dep_scanner.py to install any third-party
-# packages a user preprocessing script imports that this image doesn't ship
+# packages an adaptor.py imports that this image doesn't ship
 # (pypi.org / files.pythonhosted.org are download-only in the network policy).
 COPY --from=ghcr.io/astral-sh/uv:0.7.0 /uv /bin/uv
 
-# Runtime payload: the Go binary, the platform-owned generic evaluation engine
-# (invoked as BASE_DIR/evaluate.py), the network policy it attests at boot, and
-# the dependency scanner the pipeline runs before an eval with user preprocessing.
+# Runtime payload: the Go binary, the platform inference step (BASE_DIR/infer.py),
+# the network policy it attests at boot, and the dependency scanner the pipeline
+# runs on each adaptor. Bucket evaluators are not baked in yet: they are fetched
+# per job (config.EvaluatorsBucket).
 COPY policy/network_policy.json /app/policy/network_policy.json
 COPY dep_scanner.py /app/dep_scanner.py
-COPY tools/generic-eval/evaluate.py /app/evaluate.py
+COPY tools/infer/infer.py /app/infer.py
 COPY --from=go-builder /out/processing-tee /usr/local/bin/processing-tee
 
 # Launch-policy labels last: label edits then never invalidate the heavy
 # apt/pip layer cache above.
-LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,LISTEN_ADDR,PROCESSING_IDLE_TIMEOUT_SECONDS,PROCESSING_DEALLOCATE_AFTER_JOB,PROCESSING_EVAL_TIMEOUT_SECONDS,PROCESSING_DEPS_TIMEOUT_SECONDS,PROJECT,ZONE,INSTANCE,LEADERBOARD_SUBMIT_URL,GCP_PROJECT_ID,DATASETS_BUCKET,CATALOGUE_BASE_URL,CALLBACK_AUDIENCE"
+LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,LISTEN_ADDR,PROCESSING_IDLE_TIMEOUT_SECONDS,PROCESSING_DEALLOCATE_AFTER_JOB,PROCESSING_INFER_TIMEOUT_SECONDS,PROCESSING_ADAPTOR_TIMEOUT_SECONDS,PROCESSING_EVALUATOR_TIMEOUT_SECONDS,PROCESSING_DEPS_TIMEOUT_SECONDS,PROJECT,ZONE,INSTANCE,LEADERBOARD_SUBMIT_URL,GCP_PROJECT_ID,DATASETS_BUCKET,CATALOGUE_BASE_URL,CALLBACK_AUDIENCE"
 LABEL "tee.launch_policy.allow_cmd_override"="false"
 
 EXPOSE 443

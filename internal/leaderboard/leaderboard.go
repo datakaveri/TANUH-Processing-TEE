@@ -1,10 +1,14 @@
 // Package leaderboard builds and posts evaluation results to the external
-// benchmark leaderboard (/leaderboard/submit-solution). Submission is
-// best-effort: a failed submit never fails the pipeline. Authentication is
-// the submitting user's Keycloak Bearer JWT, forwarded through the dispatch
-// payload — the leaderboard requires its org_admin realm role; the CS
-// attestation token is NOT accepted there. Attestation claims ride in the
-// body so each entry carries its TEE provenance.
+// benchmark leaderboard (POST /leaderboard/submit-solution, see
+// tanuh-leaderboards-apis). Submission is best-effort: a failed submit never
+// fails the pipeline. Authentication is the submitting user's Keycloak Bearer
+// JWT, forwarded through the dispatch payload; the leaderboard only decodes it
+// for the `sub` claim. Attestation claims ride in the body so each entry
+// carries its TEE provenance.
+//
+// The leaderboard validates dataset_id against the catalogue and, for a
+// succeeded submission, requires every metric the dataset's catalogue entry
+// defines (see ForLeaderboard), ranking entries by the primary metric.
 package leaderboard
 
 import (
@@ -26,9 +30,17 @@ type Submission struct {
 	DatasetID     string
 	Claims        attest.Claims
 	Succeeded     bool
-	Results       map[string]any // required when Succeeded
-	Error         *ErrorInfo     // optional when !Succeeded
 	KeycloakToken string
+
+	// Succeeded submissions.
+	NumSamples     int
+	ElapsedSeconds float64
+	ModelSHA256    string
+	Providers      []string       // sent as onnx_runtime_providers (torch formats: "torch:cpu"/"torch:cuda")
+	Metrics        map[string]any // catalogue-keyed, from ForLeaderboard
+
+	// Failed submissions.
+	Error *ErrorInfo
 }
 
 // Submit POSTs one evaluation result. Never returns an error — outcomes are
@@ -56,18 +68,17 @@ func Submit(ctx context.Context, submitURL string, s Submission) {
 		"attestation": attestation,
 	}
 	status := "failed"
-	if s.Succeeded && s.Results != nil {
+	if s.Succeeded {
 		status = "succeeded"
-		metrics, _ := s.Results["metrics"].(map[string]any)
-		body["num_samples"] = s.Results["num_samples"]
-		body["elapsed_seconds"] = s.Results["elapsed_seconds"]
-		body["model_sha256"] = s.Results["model_sha256"]
-		providers := s.Results["onnx_runtime_providers"]
+		providers := s.Providers
 		if providers == nil {
-			providers = []any{}
+			providers = []string{}
 		}
+		body["num_samples"] = s.NumSamples
+		body["elapsed_seconds"] = s.ElapsedSeconds
+		body["model_sha256"] = s.ModelSHA256
 		body["onnx_runtime_providers"] = providers
-		body["metrics"] = metrics
+		body["metrics"] = s.Metrics
 	} else if s.Error != nil {
 		body["error"] = s.Error
 	}

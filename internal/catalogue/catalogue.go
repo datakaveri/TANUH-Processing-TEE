@@ -1,9 +1,10 @@
-// Package catalogue fetches a dataset's declaration (task_type, modality,
-// num_classes, class_names, preprocessing hints) from the TANUH catalogue by
-// UUID and renders it as the dataset_spec.json the generic evaluation engine
-// reads. The catalogue is the single source of truth for dataset metadata; the
-// engine never calls it. The Processing TEE fetches at job time so the
-// declaration is authoritative and the job submitter cannot influence scoring.
+// Package catalogue reads a dataset's entry from the TANUH catalogue by UUID:
+// the problem bucket (task_type) and class_names needed to run a job, and the
+// metric definitions (datasetMetrics, primaryMetric) the leaderboard validates
+// a submission against.
+//
+// The Processing TEE fetches the entry at job time, so what drives scoring and
+// submission is the catalogue's own record — the job submitter cannot change it.
 package catalogue
 
 import (
@@ -12,27 +13,26 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 )
 
-// Spec is the engine's dataset_spec.json contract.
+// Spec is what a job needs from the catalogue item.
 type Spec struct {
-	TaskType   string         `json:"task_type"`
-	Modality   string         `json:"modality"`
-	NumClasses int            `json:"num_classes,omitempty"`
-	ClassNames []string       `json:"class_names,omitempty"`
-	Input      map[string]any `json:"input,omitempty"`
-	DataFile   string         `json:"data_file,omitempty"`
+	TaskType        string         // problem bucket slug, e.g. binary_classification
+	ClassNames      []string       // in label order (label i = ClassNames[i])
+	DatasetMetrics  map[string]any // raw datasetMetrics block (metrics + descriptive fields)
+	PrimaryMetric   string         // the leaderboard ranks by metrics[PrimaryMetric]
+	SecondaryMetric string
 }
 
-// FetchSpec GETs {baseURL}/controlplane/iudx/v2/cat/item?id=<uuid> and maps the
-// catalogue item to a Spec. token is the bearer forwarded with the request.
+// FetchSpec GETs {baseURL}/controlplane/iudx/v2/cat/item?id=<uuid>.
+// token is the bearer forwarded with the request.
 //
-// NOTE (placeholder): task_type / num_classes / class_names are NEW catalogue
-// fields still being added (plan B3c). This maps them when present; the exact
-// field names should be reconciled with the finalised catalogue schema, and the
-// bearer should move to the TEE's own identity (fallback: the forwarded keycloak
-// token, used here for v1).
+// task_type and class_names are new catalogue fields; the live items do not
+// carry them yet. datasetMetrics / primaryMetric already exist.
 func FetchSpec(ctx context.Context, baseURL, uuid, token string) (Spec, error) {
 	u := fmt.Sprintf("%s/controlplane/iudx/v2/cat/item?id=%s&auditEnabled=false", baseURL, uuid)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -47,40 +47,99 @@ func FetchSpec(ctx context.Context, baseURL, uuid, token string) (Spec, error) {
 		return Spec{}, fmt.Errorf("catalogue: fetch item %s: %w", uuid, err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode != http.StatusOK {
-		return Spec{}, fmt.Errorf("catalogue: item %s status %d: %s", uuid, resp.StatusCode, string(raw))
+		return Spec{}, fmt.Errorf("catalogue: item %s status %d: %s", uuid, resp.StatusCode, snippet(raw))
 	}
+	return ParseItem(raw)
+}
+
+// ParseItem maps a cat/item response body to a Spec.
+func ParseItem(raw []byte) (Spec, error) {
 	var body struct {
 		Result []map[string]any `json:"result"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return Spec{}, fmt.Errorf("catalogue: parse item %s: %w", uuid, err)
+		return Spec{}, fmt.Errorf("catalogue: parse item: %w", err)
 	}
 	if len(body.Result) == 0 {
-		return Spec{}, fmt.Errorf("catalogue: item %s not found", uuid)
+		return Spec{}, fmt.Errorf("catalogue: item not found")
 	}
-	return specFromItem(body.Result[0]), nil
+	item := body.Result[0]
+	s := Spec{
+		TaskType:        strings.TrimSpace(str(item["task_type"])),
+		ClassNames:      classNames(item["class_names"]),
+		PrimaryMetric:   str(item["primaryMetric"]),
+		SecondaryMetric: str(item["secondaryMetric"]),
+	}
+	s.DatasetMetrics, _ = item["datasetMetrics"].(map[string]any)
+	return s, nil
 }
 
-func specFromItem(item map[string]any) Spec {
-	s := Spec{
-		TaskType: str(item["task_type"]),
-		Modality: str(item["modality"]),
-		DataFile: str(item["data_file"]),
+// Validate checks the fields a job cannot run without.
+func (s Spec) Validate() error {
+	if s.TaskType == "" {
+		return fmt.Errorf("catalogue: the dataset has no task_type (problem bucket)")
 	}
-	if n, ok := toInt(item["num_classes"]); ok {
-		s.NumClasses = n
+	if len(s.ClassNames) < 2 {
+		return fmt.Errorf("catalogue: the dataset needs at least 2 class_names, has %d", len(s.ClassNames))
 	}
-	if names, ok := item["class_names"].([]any); ok {
-		for _, v := range names {
-			s.ClassNames = append(s.ClassNames, str(v))
+	return nil
+}
+
+// MetricSpec is one metric the leaderboard requires for this dataset.
+type MetricSpec struct {
+	Name     string
+	IsMatrix bool
+	Min, Max float64
+}
+
+var rangePattern = regexp.MustCompile(`^\s*(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)\s*$`)
+
+// RequiredMetrics returns the metric keys a submission must include, using
+// the leaderboard's own rule (tanuh-leaderboards-apis internal/catalogue):
+// a datasetMetrics key whose value is a bare number is required with range
+// [0,1]; a key whose value is a "lo-hi" string is required within that range;
+// every other key is descriptive metadata. confusion_matrix is a matrix.
+func (s Spec) RequiredMetrics() map[string]MetricSpec {
+	out := map[string]MetricSpec{}
+	for key, v := range s.DatasetMetrics {
+		switch val := v.(type) {
+		case float64:
+			out[key] = MetricSpec{Name: key, Min: 0, Max: 1}
+		case string:
+			if m := rangePattern.FindStringSubmatch(val); m != nil {
+				lo, _ := strconv.ParseFloat(m[1], 64)
+				hi, _ := strconv.ParseFloat(m[2], 64)
+				out[key] = MetricSpec{Name: key, Min: lo, Max: hi}
+			}
 		}
 	}
-	if in, ok := item["input"].(map[string]any); ok {
-		s.Input = in
+	if spec, ok := out["confusion_matrix"]; ok {
+		spec.IsMatrix = true
+		out["confusion_matrix"] = spec
 	}
-	return s
+	return out
+}
+
+// classNames accepts a JSON array or a comma-separated string.
+func classNames(v any) []string {
+	var names []string
+	switch t := v.(type) {
+	case []any:
+		for _, x := range t {
+			if s := strings.TrimSpace(str(x)); s != "" {
+				names = append(names, s)
+			}
+		}
+	case string:
+		for _, s := range strings.Split(t, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				names = append(names, s)
+			}
+		}
+	}
+	return names
 }
 
 func str(v any) string {
@@ -88,17 +147,9 @@ func str(v any) string {
 	return s
 }
 
-func toInt(v any) (int, bool) {
-	switch n := v.(type) {
-	case float64:
-		return int(n), true
-	case int:
-		return n, true
-	case string:
-		var i int
-		if _, err := fmt.Sscanf(n, "%d", &i); err == nil {
-			return i, true
-		}
+func snippet(b []byte) string {
+	if len(b) > 300 {
+		return string(b[:300]) + "…"
 	}
-	return 0, false
+	return string(b)
 }

@@ -1,0 +1,53 @@
+{
+  "status": "success",
+  "task_type": "binary_classification",
+  "num_samples": 127,
+  "class_names": [
+    "Non-Suspicious",
+    "Suspicious"
+  ],
+  "metrics": {
+    "tp": 55,
+    "tn": 71,
+    "fp": 1,
+    "fn": 0,
+    "accuracy": 0.9921259842519685,
+    "sensitivity": 1.0,
+    "specificity": 0.9861111111111112,
+    "ppv": 0.9821428571428571,
+    "npv": 1.0,
+    "fnr": 0.0,
+    "fpr": 0.013888888888888888,
+    "f1": 0.990990990990991,
+    "f2": 0.9963768115942029,
+    "auc": 1.0,
+    "confusion_matrix": [
+      [
+        71,
+        1
+      ],
+      [
+        0,
+        55
+      ]
+    ]
+  },
+  "confusion_matrix": [
+    [
+      71,
+      1
+    ],
+    [
+      0,
+      55
+    ]
+  ],
+  "label_distribution": {
+    "Non-Suspicious": 72,
+    "Suspicious": 55
+  },
+  "prediction_distribution": {
+    "Non-Suspicious": 71,
+    "Suspicious": 56
+  }
+}

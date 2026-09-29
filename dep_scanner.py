@@ -1,8 +1,8 @@
 """
-dep_scanner.py — scan a user preprocessing script for missing dependencies
-and install them with UV before the evaluation subprocess is launched.
+dep_scanner.py — scan a model provider's adaptor script for missing
+dependencies and install them with UV before the adaptor stage runs.
 
-Invoked by the Go pipeline as:  python3 /app/dep_scanner.py <preprocessing.py>
+Invoked by the Go pipeline as:  python3 /app/dep_scanner.py <adaptor.py>
 (exit 0 = ready; non-zero = install failed, stderr carries the uv output).
 
 Only third-party packages that are not already importable are installed.
@@ -52,11 +52,11 @@ _IMPORT_TO_PACKAGE: dict[str, str | None] = {
 # the find_spec check.
 _ALWAYS_PRESENT: frozenset[str] = frozenset({
     "numpy", "scipy", "pandas",
-    "sklearn", "scikit_learn", "skimage",
-    "PIL", "cv2", "einops",
+    "sklearn", "scikit_learn",
+    "PIL", "cv2",
     "torch", "torchvision",
     "transformers", "tokenizers", "huggingface_hub", "safetensors",
-    "onnx", "onnxruntime", "onnxscript",
+    "onnx", "onnxruntime",
     "pydicom", "pylibjpeg",
 })
 
@@ -134,7 +134,7 @@ def install_missing_deps(script_path: Path) -> tuple[list[str], list[str]]:
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"UV failed to install preprocessing dependencies "
+            f"UV failed to install adaptor dependencies "
             f"({', '.join(to_install)}):\n{result.stderr}"
         )
 
@@ -143,7 +143,7 @@ def install_missing_deps(script_path: Path) -> tuple[list[str], list[str]]:
 
 def main() -> int:
     if len(sys.argv) != 2:
-        print("usage: dep_scanner.py <preprocessing.py>", file=sys.stderr)
+        print("usage: dep_scanner.py <adaptor.py>", file=sys.stderr)
         return 2
     script_path = Path(sys.argv[1])
     if not script_path.exists():

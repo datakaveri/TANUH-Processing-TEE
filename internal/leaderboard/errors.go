@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/datakaveri/tanuh-processing-tee/internal/eval"
+	"github.com/datakaveri/tanuh-processing-tee/internal/modelpkg"
 )
 
 var pathRe = regexp.MustCompile(`/[^\s"']+`)
@@ -27,59 +28,92 @@ type ErrorInfo struct {
 
 // envKeywords indicate environment/infrastructure failures.
 var envKeywords = []string{
-	"cuda", "gpu", "nvidia", "cudnn", "onnxruntime",
-	"gcs", "secret manager", "connection", "timeout",
+	"cuda", "gpu", "nvidia", "cudnn",
+	"gcs", "kms", "secret manager", "connection", "timeout",
 	"no space", "out of memory", "oom",
 }
 
-// Classify maps a pipeline error onto the leaderboard error schema.
+// Classify maps a pipeline error onto the leaderboard's error categories
+// (tanuh-leaderboards-apis models.SubmissionError):
 //
-// error_code:
+//	1 = data loading / pre- or post-processing: a dataset file that will not
+//	    decode, the adaptor, its dependencies, or its predictions
+//	2 = model loading: the model file, its declared format, or running it
+//	3 = container / runtime: CUDA, timeouts, the evaluator, metric mapping,
+//	    GCS/KMS/catalogue, anything else in the platform
 //
-//	1 = user-supplied code (preprocessing script / model loading)
-//	2 = our eval scripts / dataloader / pipeline
-//	3 = environment (CUDA / GPU / GCS / Secret Manager / network)
-//
-// Ported from _classify_leaderboard_error; exception class names become
-// stable Go-side type strings with the same eval-exit-code mapping.
+// Stage failures get fixed messages; stage output never leaves the TEE.
 func Classify(err error) ErrorInfo {
-	var exitErr *eval.ExitCodeError
-	if errors.As(err, &exitErr) {
-		switch exitErr.Code {
-		case 10:
-			return ErrorInfo{1, "EvalUserCodeError", "Preprocessing script failed to load or execute."}
-		case 11:
-			return ErrorInfo{3, "EvalEnvironmentError", "CUDA/GPU runtime error in evaluation script."}
-		default:
-			return ErrorInfo{2, "EvalScriptError",
-				fmt.Sprintf("Evaluation script exited with code %d.", exitErr.Code)}
-		}
+	var st *eval.StageError
+	if errors.As(err, &st) {
+		return classifyStage(st)
+	}
+	var fe *modelpkg.FormatError
+	if errors.As(err, &fe) {
+		return ErrorInfo{2, "ModelFormatError", SanitizeMsg(fe.Msg)}
+	}
+	var ao *eval.AdaptorOutputError
+	if errors.As(err, &ao) {
+		return ErrorInfo{1, "AdaptorOutputError", SanitizeMsg(ao.Msg)}
+	}
+	var me *MetricError
+	if errors.As(err, &me) {
+		return ErrorInfo{3, me.Kind, SanitizeMsg(me.Msg)}
 	}
 
 	msg := err.Error()
 	lower := strings.ToLower(msg)
+	var depsErr *eval.DepsError
+	isDeps := errors.As(err, &depsErr)
 	for _, kw := range envKeywords {
 		if strings.Contains(lower, kw) {
 			return ErrorInfo{3, "EnvironmentError", SanitizeMsg(msg)}
 		}
 	}
-
-	// Pre-eval dependency install failure (dep_scanner/uv). Checked after the
-	// env keywords so a network/timeout failure classifies as environment;
-	// anything else (nonexistent package, resolution conflict) is the user's
-	// imports.
-	var depsErr *eval.DepsError
-	if errors.As(err, &depsErr) {
-		return ErrorInfo{1, "PreprocessingDepsError", SanitizeMsg(msg)}
+	// A dependency install that failed for a non-network reason (unknown
+	// package, resolution conflict) is the adaptor's imports.
+	if isDeps {
+		return ErrorInfo{1, "AdaptorDepsError", SanitizeMsg(msg)}
 	}
-
 	if errors.Is(err, fs.ErrNotExist) {
 		return ErrorInfo{3, "FileNotFoundError", SanitizeMsg(msg)}
 	}
 	if errors.Is(err, fs.ErrPermission) {
 		return ErrorInfo{3, "PermissionError", SanitizeMsg(msg)}
 	}
+	return ErrorInfo{3, "PipelineError", SanitizeMsg(msg)}
+}
 
-	// Default: our pipeline.
-	return ErrorInfo{2, "PipelineError", SanitizeMsg(msg)}
+func classifyStage(st *eval.StageError) ErrorInfo {
+	switch st.Stage {
+	case eval.StageInfer:
+		switch {
+		case st.TimedOut:
+			return ErrorInfo{3, "InferenceTimeout", "Model inference exceeded its time limit."}
+		case st.ExitCode == 11:
+			return ErrorInfo{3, "CudaError", "CUDA/GPU runtime error during inference."}
+		case st.ExitCode == 13:
+			return ErrorInfo{2, "ModelError", "The model could not be loaded, or does not accept the platform's input."}
+		case st.ExitCode == 14:
+			return ErrorInfo{1, "DatasetDecodeError", "A dataset file could not be decoded."}
+		default:
+			return ErrorInfo{3, "InferenceError", fmt.Sprintf("Inference exited with code %d.", st.ExitCode)}
+		}
+	case eval.StageAdaptor:
+		if st.TimedOut {
+			return ErrorInfo{1, "AdaptorError", "The adaptor exceeded its time limit."}
+		}
+		return ErrorInfo{1, "AdaptorError", fmt.Sprintf("The adaptor exited with code %d.", st.ExitCode)}
+	case eval.StageEvaluator:
+		switch {
+		case st.ExitCode == 12:
+			return ErrorInfo{1, "PredictionsInvalidError",
+				"predictions.csv does not match the bucket's format (missing, duplicate or unknown files, or invalid values)."}
+		case st.TimedOut:
+			return ErrorInfo{3, "EvaluatorError", "The evaluator exceeded its time limit."}
+		default:
+			return ErrorInfo{3, "EvaluatorError", fmt.Sprintf("The evaluator exited with code %d.", st.ExitCode)}
+		}
+	}
+	return ErrorInfo{3, "PipelineError", st.Error()}
 }

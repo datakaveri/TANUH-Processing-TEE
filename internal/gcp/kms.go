@@ -23,6 +23,8 @@ func AsymmetricDecrypt(ctx context.Context, keyVersion, wrappedDEKB64 string) ([
 	}
 	u := fmt.Sprintf("https://cloudkms.googleapis.com/v1/%s:asymmetricDecrypt", keyVersion)
 	body, _ := json.Marshal(map[string]string{"ciphertext": wrappedDEKB64})
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -30,8 +32,8 @@ func AsymmetricDecrypt(ctx context.Context, keyVersion, wrappedDEKB64 string) ([
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	// Shared keep-alive client (gcs.go): one unwrap per dataset file.
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("gcp: KMS asymmetricDecrypt: %w", err)
 	}
