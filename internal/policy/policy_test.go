@@ -17,7 +17,7 @@ func TestHashMatchesPython(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hash policy: %v", err)
 	}
-	const golden = "e0973010fab9192b4275d84e1403a573cdf84e0a70d47c8bfe95af525de4a10e"
+	const golden = "77ca21641ecc133b430ff70f68fe55f0f8f84ff2942ec99b5c49760a58cb2c61"
 	if got != golden {
 		t.Fatalf("policy hash diverged from Python golden:\n got  %s\n want %s", got, golden)
 	}

@@ -23,7 +23,7 @@ import (
 // Submission carries everything needed for one leaderboard POST.
 type Submission struct {
 	JobID         string
-	DatasetID     int
+	DatasetID     string
 	Claims        attest.Claims
 	Succeeded     bool
 	Results       map[string]any // required when Succeeded
@@ -34,11 +34,6 @@ type Submission struct {
 // Submit POSTs one evaluation result. Never returns an error — outcomes are
 // logged, and the pipeline's success does not depend on it.
 func Submit(ctx context.Context, submitURL string, s Submission) {
-	slug, ok := datasetSlug[s.DatasetID]
-	if !ok {
-		log.Printf("leaderboard: no vertical for dataset_id=%d; skipping submit", s.DatasetID)
-		return
-	}
 	// The leaderboard authenticates the caller's Keycloak Bearer JWT. If the
 	// browser did not forward one, skip rather than send a token the
 	// leaderboard will reject.
@@ -57,7 +52,7 @@ func Submit(ctx context.Context, submitURL string, s Submission) {
 
 	body := map[string]any{
 		"job_id":      UUID5("tanuh:" + s.JobID),
-		"dataset_id":  slug,
+		"dataset_id":  s.DatasetID,
 		"attestation": attestation,
 	}
 	status := "failed"
@@ -72,7 +67,7 @@ func Submit(ctx context.Context, submitURL string, s Submission) {
 			providers = []any{}
 		}
 		body["onnx_runtime_providers"] = providers
-		body["metrics"] = MapMetrics(s.DatasetID, metrics)
+		body["metrics"] = metrics
 	} else if s.Error != nil {
 		body["error"] = s.Error
 	}
@@ -101,7 +96,7 @@ func Submit(ctx context.Context, submitURL string, s Submission) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-		log.Printf("leaderboard: %s submitted for job %s (%s) → %d", status, s.JobID, slug, resp.StatusCode)
+		log.Printf("leaderboard: %s submitted for job %s (dataset %s) → %d", status, s.JobID, s.DatasetID, resp.StatusCode)
 	} else {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
 		log.Printf("leaderboard: submit for job %s returned %d: %s", s.JobID, resp.StatusCode, string(snippet))

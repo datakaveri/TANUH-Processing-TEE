@@ -16,57 +16,6 @@ func TestUUID5MatchesPython(t *testing.T) {
 	}
 }
 
-func TestMapMetricsOralCancer(t *testing.T) {
-	in := map[string]any{
-		"sensitivity": 1.0, "specificity": 0.9, "accuracy": 0.95,
-		"ppv": 0.8, "npv": 0.7, "f2": 0.85, "extraneous": 42.0,
-	}
-	out := MapMetrics(2, in)
-	if out["f2_score"] != 0.85 {
-		t.Fatalf("f2_score = %v, want 0.85", out["f2_score"])
-	}
-	if _, ok := out["extraneous"]; ok {
-		t.Fatal("extraneous key leaked into oral cancer metrics")
-	}
-	if _, ok := out["f2"]; ok {
-		t.Fatal("raw f2 key should not appear")
-	}
-}
-
-func TestMapMetricsBreastCancerDerivesWeightedF2(t *testing.T) {
-	in := map[string]any{
-		"accuracy": 0.9,
-		"per_class": map[string]any{
-			// support 10, f2(1,1)=1
-			"a": map[string]any{"TP": 5.0, "FN": 5.0, "precision": 1.0, "recall": 1.0},
-			// support 10, f2(p=0.5,r=0.5): 5*0.25/(2+0.5)=0.5
-			"b": map[string]any{"TP": 2.0, "FN": 8.0, "precision": 0.5, "recall": 0.5},
-		},
-	}
-	out := MapMetrics(1, in)
-	wf2, ok := out["weighted_f2"].(float64)
-	if !ok {
-		t.Fatalf("weighted_f2 missing: %v", out)
-	}
-	if diff := wf2 - 0.75; diff > 1e-9 || diff < -1e-9 {
-		t.Fatalf("weighted_f2 = %v, want 0.75", wf2)
-	}
-	if _, ok := out["macro_f2"]; ok {
-		t.Fatal("nil macro_f2 should be omitted")
-	}
-}
-
-func TestMapMetricsUnknownDatasetPassthrough(t *testing.T) {
-	in := map[string]any{"anything": 1.0, "nothing": nil}
-	out := MapMetrics(3, in)
-	if out["anything"] != 1.0 {
-		t.Fatal("passthrough failed")
-	}
-	if _, ok := out["nothing"]; ok {
-		t.Fatal("nil value should be omitted")
-	}
-}
-
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		name     string

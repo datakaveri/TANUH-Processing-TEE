@@ -11,12 +11,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/datakaveri/tanuh-processing-tee/internal/attest"
+	"github.com/datakaveri/tanuh-processing-tee/internal/catalogue"
 	"github.com/datakaveri/tanuh-processing-tee/internal/eval"
-	"github.com/datakaveri/tanuh-processing-tee/internal/gcp"
 	"github.com/datakaveri/tanuh-processing-tee/internal/leaderboard"
 )
 
@@ -28,7 +27,7 @@ const (
 // materialized holds everything RunJob needs after payload validation.
 type materialized struct {
 	jobID             string
-	datasetID         int
+	datasetUUID       string
 	jobDir            string
 	runtimeDir        string
 	modelPath         string
@@ -68,7 +67,7 @@ func (m *Manager) RunJob(ctx context.Context, payload map[string]any) {
 	claims := attest.FetchClaims(ctx, m.cfg.AttestAudience)
 	leaderboard.Submit(ctx, m.cfg.LeaderboardURL, leaderboard.Submission{
 		JobID:         jobID,
-		DatasetID:     datasetIDField(payload),
+		DatasetID:     stringField(payload, "dataset_id"),
 		Claims:        claims,
 		Succeeded:     false,
 		Error:         &errInfo,
@@ -90,41 +89,35 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 		s.LastJobID = job.jobID
 		s.LastError = ""
 	})
-	log.Printf("pipeline: secure job %s: starting pipeline for dataset_id=%d", job.jobID, job.datasetID)
+	log.Printf("pipeline: secure job %s: starting pipeline for dataset %s", job.jobID, job.datasetUUID)
 
-	dataset, err := m.cfg.Dataset(job.datasetID)
+	// Decrypt the dataset package (DATA zip + ground-truth table + manifests)
+	// into a per-job temp folder, extracting the zip in Go. The folder holds
+	// decrypted PII, so it is wiped when the job finishes (success or failure).
+	datasetDir := filepath.Join(job.runtimeDir, "dataset")
+	defer os.RemoveAll(datasetDir)
+	if err := m.fetchAndDecryptDataset(ctx, job.datasetUUID, datasetDir); err != nil {
+		return err
+	}
+
+	// Fetch the declaration (task_type, modality, class_names, …) from the
+	// catalogue by UUID and stage it as dataset_spec.json for the engine.
+	spec, err := catalogue.FetchSpec(ctx, m.cfg.CatalogueBaseURL, job.datasetUUID, job.keycloakToken)
+	if err != nil {
+		return fmt.Errorf("pipeline: fetch dataset declaration: %w", err)
+	}
+	specBytes, err := json.MarshalIndent(spec, "", "  ")
 	if err != nil {
 		return err
 	}
-
-	// Step 1: fetch the AES-256 dataset key and the encrypted dataset JSON,
-	// decrypt in memory (it is small).
-	key, err := m.datasetKey(ctx, dataset.SecretID)
-	if err != nil {
+	if err := os.WriteFile(filepath.Join(datasetDir, "dataset_spec.json"), specBytes, 0o644); err != nil {
 		return err
 	}
-	datasetPath, err := m.decryptDatasetJSON(ctx, key, dataset, job)
-	if err != nil {
-		return err
-	}
-	log.Printf("pipeline: secure job %s: dataset decrypted to %s", job.jobID, datasetPath)
+	log.Printf("pipeline: secure job %s: dataset ready in %s (task=%s modality=%s)",
+		job.jobID, datasetDir, spec.TaskType, spec.Modality)
 
-	// Step 2: fetch the encrypted image zip, decrypt (chunked stream), extract.
-	if err := m.fetchAndExtractImages(ctx, key, dataset, job.datasetID); err != nil {
-		return err
-	}
-
-	// Step 3: pull the dataset's evaluation script.
-	scriptPath := filepath.Join(m.workflowDir(), fmt.Sprintf("evaluation_script_%d.py", job.datasetID))
-	log.Printf("pipeline: secure job %s: fetching eval script gs://%s/%s",
-		job.jobID, m.cfg.EvalScriptsBucket, dataset.EvalScriptObject)
-	if err := gcp.DownloadObject(ctx, m.cfg.EvalScriptsBucket, dataset.EvalScriptObject, scriptPath); err != nil {
-		return err
-	}
-
-	// Step 4: when the user sent a preprocessing script, install any
-	// third-party imports the image doesn't ship (dep_scanner.py + uv)
-	// before the eval subprocess launches.
+	// When the user sent a preprocessing script, install any third-party imports
+	// the image doesn't ship (dep_scanner.py + uv) before the eval subprocess.
 	if job.preprocessingPath != "" {
 		if err := eval.InstallDeps(ctx, m.cfg.BaseDir,
 			filepath.Join(m.cfg.BaseDir, "dep_scanner.py"),
@@ -133,9 +126,10 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 		}
 	}
 
-	// Step 5: run the evaluation subprocess.
+	// Run the platform-owned generic evaluation engine (shipped in the image).
+	enginePath := filepath.Join(m.cfg.BaseDir, "evaluate.py")
 	resultsPath := filepath.Join(job.runtimeDir, "results.json")
-	if err := eval.Run(ctx, m.cfg.BaseDir, scriptPath, job.modelPath, datasetPath,
+	if err := eval.Run(ctx, m.cfg.BaseDir, enginePath, job.modelPath, datasetDir,
 		resultsPath, job.preprocessingPath, m.cfg.EvalTimeout); err != nil {
 		return err
 	}
@@ -146,12 +140,12 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 	}
 	log.Printf("pipeline: secure job %s: results saved to %s", job.jobID, resultsPath)
 
-	// Step 5: report — attestation claims ride in the leaderboard body.
+	// Report — attestation claims ride in the leaderboard body.
 	log.Printf("pipeline: secure job %s: fetching attestation claims for leaderboard", job.jobID)
 	claims := attest.FetchClaims(ctx, m.cfg.AttestAudience)
 	leaderboard.Submit(ctx, m.cfg.LeaderboardURL, leaderboard.Submission{
 		JobID:         job.jobID,
-		DatasetID:     job.datasetID,
+		DatasetID:     job.datasetUUID,
 		Claims:        claims,
 		Succeeded:     true,
 		Results:       results,
@@ -186,7 +180,7 @@ func (m *Manager) materialize(payload map[string]any) (*materialized, error) {
 
 	job := &materialized{
 		jobID:         stringField(payload, "job_id"),
-		datasetID:     datasetIDField(payload),
+		datasetUUID:   stringField(payload, "dataset_id"),
 		submittedBy:   stringField(payload, "submitted_by"),
 		keycloakToken: stringField(payload, "keycloak_token"),
 		bufferJobURL:  stringField(payload, "buffer_job_url"),
@@ -194,8 +188,8 @@ func (m *Manager) materialize(payload map[string]any) (*materialized, error) {
 	if job.jobID == "" {
 		return nil, fmt.Errorf("pipeline: empty job_id")
 	}
-	if job.datasetID == 0 {
-		return nil, fmt.Errorf("pipeline: invalid dataset_id")
+	if job.datasetUUID == "" {
+		return nil, fmt.Errorf("pipeline: empty dataset_id")
 	}
 
 	job.jobDir = m.jobDir(job.jobID)
@@ -247,23 +241,6 @@ func (m *Manager) materialize(payload map[string]any) (*materialized, error) {
 	return job, nil
 }
 
-// datasetKey fetches and decodes the hex AES-256 key from Secret Manager.
-func (m *Manager) datasetKey(ctx context.Context, secretID string) ([]byte, error) {
-	log.Printf("pipeline: fetching AES-256 key from Secret Manager: %s", secretID)
-	keyHex, err := gcp.AccessSecret(ctx, m.cfg.ProjectID, secretID)
-	if err != nil {
-		return nil, err
-	}
-	key, err := hex.DecodeString(strings.TrimSpace(string(keyHex)))
-	if err != nil {
-		return nil, fmt.Errorf("pipeline: dataset key is not valid hex: %w", err)
-	}
-	if len(key) != 32 {
-		return nil, fmt.Errorf("pipeline: dataset key is %d bytes, want 32", len(key))
-	}
-	return key, nil
-}
-
 func stringField(payload map[string]any, key string) string {
 	s, _ := payload[key].(string)
 	return s
@@ -277,19 +254,6 @@ func fileNameField(payload map[string]any, key, def string) string {
 		return def
 	}
 	return v
-}
-
-func datasetIDField(payload map[string]any) int {
-	switch v := payload["dataset_id"].(type) {
-	case float64:
-		return int(v)
-	case string:
-		n, _ := strconv.Atoi(v)
-		return n
-	case int:
-		return v
-	}
-	return 0
 }
 
 // decodeAndVerify base64-decodes payload[b64Key] and enforces the SHA-256
@@ -333,7 +297,7 @@ func (m *Manager) enrichResults(resultsPath string, job *materialized) (map[stri
 	results["job_id"] = job.jobID
 	results["model_sha256"] = modelSHA
 	results["weights_sha256"] = weightsSHA
-	results["dataset_id"] = job.datasetID
+	results["dataset_id"] = job.datasetUUID
 
 	out, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {

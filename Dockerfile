@@ -1,10 +1,11 @@
 # TANUH Processing TEE — single Go binary + Python eval runtime.
 #
 # The Go binary (processing-tee) owns the whole pipeline: RA-TLS intake,
-# dataset fetch/decrypt, leaderboard submission, buffer completion callback,
-# self-deallocation. Python exists in this image ONLY for the evaluation
-# scripts fetched from gs://tanuh-eval-scripts at job time (onnxruntime and
-# friends), executed as a subprocess.
+# dataset fetch/decrypt, catalogue declaration fetch, leaderboard submission,
+# buffer completion callback, self-deallocation. Python exists in this image
+# ONLY for the platform-owned generic evaluation engine (tools/generic-eval/
+# evaluate.py — onnxruntime + scikit-learn + per-modality decoders), executed
+# as a subprocess.
 FROM golang:1.26-bookworm AS go-builder
 WORKDIR /src
 COPY go.mod ./
@@ -75,16 +76,17 @@ RUN python -m pip install --upgrade pip \
 # (pypi.org / files.pythonhosted.org are download-only in the network policy).
 COPY --from=ghcr.io/astral-sh/uv:0.7.0 /uv /bin/uv
 
-# Runtime payload: the Go binary, the network policy it attests at boot, and
-# the dependency scanner the pipeline runs before an eval with user
-# preprocessing. Eval scripts themselves arrive from GCS at job time.
+# Runtime payload: the Go binary, the platform-owned generic evaluation engine
+# (invoked as BASE_DIR/evaluate.py), the network policy it attests at boot, and
+# the dependency scanner the pipeline runs before an eval with user preprocessing.
 COPY policy/network_policy.json /app/policy/network_policy.json
 COPY dep_scanner.py /app/dep_scanner.py
+COPY tools/generic-eval/evaluate.py /app/evaluate.py
 COPY --from=go-builder /out/processing-tee /usr/local/bin/processing-tee
 
 # Launch-policy labels last: label edits then never invalidate the heavy
 # apt/pip layer cache above.
-LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,LISTEN_ADDR,PROCESSING_IDLE_TIMEOUT_SECONDS,PROCESSING_DEALLOCATE_AFTER_JOB,PROCESSING_EVAL_TIMEOUT_SECONDS,PROCESSING_DEPS_TIMEOUT_SECONDS,PROJECT,ZONE,INSTANCE,LEADERBOARD_SUBMIT_URL,GCP_PROJECT_ID,DATASETS_BUCKET,EVAL_SCRIPTS_BUCKET,CALLBACK_AUDIENCE"
+LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,LISTEN_ADDR,PROCESSING_IDLE_TIMEOUT_SECONDS,PROCESSING_DEALLOCATE_AFTER_JOB,PROCESSING_EVAL_TIMEOUT_SECONDS,PROCESSING_DEPS_TIMEOUT_SECONDS,PROJECT,ZONE,INSTANCE,LEADERBOARD_SUBMIT_URL,GCP_PROJECT_ID,DATASETS_BUCKET,CATALOGUE_BASE_URL,CALLBACK_AUDIENCE"
 LABEL "tee.launch_policy.allow_cmd_override"="false"
 
 EXPOSE 443

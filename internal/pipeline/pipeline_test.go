@@ -33,19 +33,6 @@ func TestDecodeAndVerify(t *testing.T) {
 	}
 }
 
-func TestDatasetIDField(t *testing.T) {
-	for _, tc := range []struct {
-		in   any
-		want int
-	}{
-		{2.0, 2}, {"1", 1}, {3, 3}, {"x", 0}, {nil, 0},
-	} {
-		if got := datasetIDField(map[string]any{"dataset_id": tc.in}); got != tc.want {
-			t.Fatalf("datasetIDField(%v) = %d, want %d", tc.in, got, tc.want)
-		}
-	}
-}
-
 func TestFileNameFieldRejectsTraversal(t *testing.T) {
 	payload := map[string]any{"model_file": "../../etc/passwd"}
 	if got := fileNameField(payload, "model_file", "model.onnx"); got != "model.onnx" {

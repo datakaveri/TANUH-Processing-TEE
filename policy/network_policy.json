@@ -34,9 +34,9 @@
       "destination": "benchmark.tanuh.ai",
       "protocol": "tcp",
       "ports": [443],
-      "download": "DENY",
+      "download": "ALLOW",
       "upload": "ALLOW",
-      "description": "Allow benchmark result upload only"
+      "description": "Allow leaderboard result upload and catalogue (cat/item) declaration download"
     },
 
     {
