@@ -22,7 +22,7 @@ scipy==1.17.1
 onnx==1.23.0
 # CUDA 12.1 wheels (installed via the cu121 extra-index in the Dockerfile);
 # compatible with the CUDA 12.3 runtime base image.
-torch==2.5.1
+torch==2.13.0
 torchvision==0.20.1
 transformers==4.46.3
 safetensors==0.8.0
