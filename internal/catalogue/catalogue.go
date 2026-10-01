@@ -1,7 +1,7 @@
 // Package catalogue reads a dataset's entry from the TANUH catalogue by UUID:
-// the problem bucket (task_type) and class_names needed to run a job, and the
-// metric definitions (datasetMetrics, primaryMetric) the leaderboard validates
-// a submission against.
+// the problem bucket (problemStatement) and class_names needed to run a job,
+// and the metric definitions (datasetMetrics, primaryMetric) the leaderboard
+// validates a submission against.
 //
 // The Processing TEE fetches the entry at job time, so what drives scoring and
 // submission is the catalogue's own record — the job submitter cannot change it.
@@ -31,8 +31,8 @@ type Spec struct {
 // FetchSpec GETs {baseURL}/controlplane/iudx/v2/cat/item?id=<uuid>.
 // token is the bearer forwarded with the request.
 //
-// task_type and class_names are new catalogue fields; the live items do not
-// carry them yet. datasetMetrics / primaryMetric already exist.
+// problemStatement is written by the UI's dataset metadata form; class_names
+// has no form field yet. datasetMetrics / primaryMetric already exist.
 func FetchSpec(ctx context.Context, baseURL, uuid, token string) (Spec, error) {
 	u := fmt.Sprintf("%s/controlplane/iudx/v2/cat/item?id=%s&auditEnabled=false", baseURL, uuid)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -66,8 +66,15 @@ func ParseItem(raw []byte) (Spec, error) {
 		return Spec{}, fmt.Errorf("catalogue: item not found")
 	}
 	item := body.Result[0]
+	// The UI's metadata form names the bucket "problemStatement" (values are
+	// the bucket slugs, e.g. binary_classification); "task_type" is the name
+	// this TEE used first and is still accepted.
+	bucket := strings.TrimSpace(str(item["problemStatement"]))
+	if bucket == "" {
+		bucket = strings.TrimSpace(str(item["task_type"]))
+	}
 	s := Spec{
-		TaskType:        strings.TrimSpace(str(item["task_type"])),
+		TaskType:        bucket,
 		ClassNames:      classNames(item["class_names"]),
 		PrimaryMetric:   str(item["primaryMetric"]),
 		SecondaryMetric: str(item["secondaryMetric"]),
@@ -79,7 +86,7 @@ func ParseItem(raw []byte) (Spec, error) {
 // Validate checks the fields a job cannot run without.
 func (s Spec) Validate() error {
 	if s.TaskType == "" {
-		return fmt.Errorf("catalogue: the dataset has no task_type (problem bucket)")
+		return fmt.Errorf("catalogue: the dataset has no problemStatement (problem bucket, e.g. binary_classification)")
 	}
 	if len(s.ClassNames) < 2 {
 		return fmt.Errorf("catalogue: the dataset needs at least 2 class_names, has %d", len(s.ClassNames))

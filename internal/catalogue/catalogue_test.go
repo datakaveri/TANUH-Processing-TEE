@@ -4,6 +4,7 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -83,6 +84,33 @@ func TestRangeStringsAndDescriptiveFields(t *testing.T) {
 	}
 }
 
+func TestBucketFromProblemStatement(t *testing.T) {
+	cases := map[string]struct {
+		item string
+		want string
+	}{
+		// As the UI's metadata form writes it (the live entries on 30 Sep 2026).
+		"problemStatement":                  {`{"problemStatement":"multiclass_classification","class_names":["A","B","C","D"]}`, "multiclass_classification"},
+		"wins over task_type":               {`{"problemStatement":"binary_classification","task_type":"multiclass_classification"}`, "binary_classification"},
+		"task_type fallback":                {`{"task_type":"binary_classification"}`, "binary_classification"},
+		"empty problemStatement falls back": {`{"problemStatement":"  ","task_type":"binary_classification"}`, "binary_classification"},
+		"neither":                           {`{"label":"Oral Cancer"}`, ""},
+	}
+	for name, c := range cases {
+		s, err := ParseItem([]byte(`{"result":[` + c.item + `]}`))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if s.TaskType != c.want {
+			t.Errorf("%s: bucket = %q, want %q", name, s.TaskType, c.want)
+		}
+	}
+	s, _ := ParseItem([]byte(`{"result":[{"label":"Oral Cancer","class_names":["a","b"]}]}`))
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "problemStatement") {
+		t.Fatalf("missing bucket error = %v, want it to name problemStatement", err)
+	}
+}
+
 func TestParseItemAndValidate(t *testing.T) {
 	raw := []byte(`{"result":[{"task_type":" binary_classification ","class_names":"Non-Suspicious, Suspicious","primaryMetric":"f2_score"}]}`)
 	s, err := ParseItem(raw)
@@ -95,9 +123,9 @@ func TestParseItemAndValidate(t *testing.T) {
 	if err := s.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	// The live entries do not have task_type / class_names yet.
+	// These fixtures predate the problemStatement / class_names fields.
 	if err := load(t, "ocs").Validate(); err == nil {
-		t.Fatal("entry without task_type passed validation")
+		t.Fatal("entry without a bucket passed validation")
 	}
 	if _, err := ParseItem([]byte(`{"result":[]}`)); err == nil {
 		t.Fatal("empty result accepted")

@@ -9,6 +9,7 @@ so the tests pin the CLI, the exit codes and the results.json shape.
 
 import csv
 import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -76,21 +77,69 @@ class BinaryEvaluator(unittest.TestCase):
     def test_invalid_predictions_exit_12(self):
         cases = {
             "missing row": BIN_OK[:3],
-            "duplicate row": BIN_OK + [["a.jpg", 0, 0.1]],
-            "unknown file": BIN_OK + [["zzz.jpg", 0, 0.1]],
+            "conflicting duplicate": BIN_OK + [["a.jpg", 1, 0.9]],
             "label 2": [["a.jpg", 2, 0.1]] + BIN_OK[1:],
-            "score > 1": [["a.jpg", 0, 1.5]] + BIN_OK[1:],
             "score nan": [["a.jpg", 0, "nan"]] + BIN_OK[1:],
             "score text": [["a.jpg", 0, "high"]] + BIN_OK[1:],
+            "ids nobody recognises": [["x" + r[0], *r[1:]] for r in BIN_OK],
         }
         for name, rows in cases.items():
             with self.subTest(name):
                 code, _, out = run_eval(BINARY, BIN_GT, BIN_HDR, rows, BIN_CLASSES)
                 self.assertEqual(code, 12, out)
+        code, _, out = run_eval(BINARY, BIN_GT, ["file", "note"], [[r[0], "x"] for r in BIN_OK], BIN_CLASSES)
+        self.assertEqual(code, 12, out)  # neither a label nor a score
 
-    def test_missing_column_exit_12(self):
-        code, _, out = run_eval(BINARY, BIN_GT, ["file", "label"], [r[:2] for r in BIN_OK], BIN_CLASSES)
-        self.assertEqual(code, 12, out)
+    def test_flexible_columns_and_ids(self):
+        want = run_eval(BINARY, BIN_GT, BIN_HDR, BIN_OK, BIN_CLASSES)[1]["metrics"]
+        variants = {
+            "other names": (["image_id", "prediction", "probability"], BIN_OK),
+            "class-name score": (["filename", "pred", "prob_Suspicious"], BIN_OK),
+            "columns reordered": (["score", "label", "file"], [[r[2], r[1], r[0]] for r in BIN_OK]),
+            "ids without extension": (BIN_HDR, [[r[0][:-4], *r[1:]] for r in BIN_OK]),
+            "labels as names": (BIN_HDR, [[r[0], BIN_CLASSES[r[1]], r[2]] for r in BIN_OK]),
+            "extra columns + unknown row": (["file", "label", "score", "note"],
+                                            [r + ["x"] for r in BIN_OK] + [["zzz.jpg", 0, 0.1, "x"]]),
+            "identical duplicate": (BIN_HDR, BIN_OK + [BIN_OK[0]]),
+        }
+        for name, (hdr, rows) in variants.items():
+            with self.subTest(name):
+                code, res, out = run_eval(BINARY, BIN_GT, hdr, rows, BIN_CLASSES)
+                self.assertEqual(code, 0, out)
+                self.assertEqual(res["metrics"], want)
+        _, res, _ = run_eval(BINARY, BIN_GT, BIN_HDR, BIN_OK + [["zzz.jpg", 0, 0.1]], BIN_CLASSES)
+        self.assertEqual(res["predictions_format"]["ignored_rows"], 1)
+
+    def test_label_derived_from_score(self):
+        rows = [[r[0], r[2]] for r in BIN_OK]  # file,score: labels = score >= 0.5
+        code, res, out = run_eval(BINARY, BIN_GT, ["file", "score"], rows, BIN_CLASSES)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(res["prediction_distribution"], {"Non-Suspicious": 2, "Suspicious": 2})
+        self.assertEqual(res["predictions_format"]["label_from"], "score >= 0.5")
+
+    def test_logits_become_probabilities(self):
+        rows = [[r[0], [-2.2, 2.2, -0.4, 0.4][i]] for i, r in enumerate(BIN_OK)]
+        code, res, out = run_eval(BINARY, BIN_GT, ["file", "logit"], rows, BIN_CLASSES)
+        self.assertEqual(code, 0, out)
+        want = run_eval(BINARY, BIN_GT, BIN_HDR, BIN_OK, BIN_CLASSES)[1]["metrics"]
+        self.assertEqual(res["metrics"], want)  # same ranking and the same 0.5 threshold
+        self.assertEqual(res["predictions_format"]["score_transform"], "sigmoid")
+
+    def test_labels_only_omits_auc(self):
+        code, res, out = run_eval(BINARY, BIN_GT, ["file", "label"], [r[:2] for r in BIN_OK], BIN_CLASSES)
+        self.assertEqual(code, 0, out)
+        self.assertIsNone(res["metrics"]["auc"])
+        self.assertAlmostEqual(res["metrics"]["accuracy"], 0.5)
+
+    def test_semicolon_delimiter(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "gt.csv").write_text("file,label\n" + "".join(f"{f},{l}\n" for f, l in BIN_GT))
+        (d / "p.csv").write_text("file;label;score\n" + "".join(f"{f};{l};{s}\n" for f, l, s in BIN_OK))
+        (d / "spec.json").write_text(json.dumps({"class_names": BIN_CLASSES}))
+        proc = subprocess.run([sys.executable, str(BINARY), "--predictions", str(d / "p.csv"),
+                               "--ground-truth", str(d / "gt.csv"), "--spec", str(d / "spec.json"),
+                               "--results", str(d / "r.json")], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_bad_spec_is_not_blamed_on_the_model(self):
         code, _, _ = run_eval(BINARY, BIN_GT, BIN_HDR, BIN_OK, ["only-one"])
@@ -138,11 +187,10 @@ class MulticlassEvaluator(unittest.TestCase):
     def test_invalid_predictions_exit_12(self):
         cases = {
             "missing row": MC_OK[:4],
-            "duplicate row": MC_OK + [MC_OK[0]],
-            "unknown file": MC_OK + [["x.dcm", 0, 1, 0, 0, 0]],
+            "conflicting duplicate": MC_OK + [["s1.dcm", 1, 0.1, 0.7, 0.1, 0.1]],
             "label out of range": [["s1.dcm", 4, 0.7, 0.1, 0.1, 0.1]] + MC_OK[1:],
-            "probs do not sum to 1": [["s1.dcm", 0, 0.9, 0.9, 0.1, 0.1]] + MC_OK[1:],
-            "negative prob": [["s1.dcm", 0, 1.2, -0.2, 0.0, 0.0]] + MC_OK[1:],
+            "probability text": [["s1.dcm", 0, "high", 0.1, 0.1, 0.1]] + MC_OK[1:],
+            "all-zero row": [["s1.dcm", 0, 0, 0, 0, 0]] + MC_OK[1:],
         }
         for name, rows in cases.items():
             with self.subTest(name):
@@ -153,6 +201,42 @@ class MulticlassEvaluator(unittest.TestCase):
         hdr = MC_HDR[:-1]
         code, _, out = run_eval(MULTI, MC_GT, hdr, [r[:-1] for r in MC_OK], MC_CLASSES)
         self.assertEqual(code, 12, out)
+
+    def test_flexible_columns_and_ids(self):
+        want = run_eval(MULTI, MC_GT, MC_HDR, MC_OK, MC_CLASSES)[1]["metrics"]
+        variants = {
+            "class-name columns": (["image", "prediction", "A", "B", "C", "D"], MC_OK),
+            "prob_<name> columns": (["file", "label", "prob_A", "prob_B", "prob_C", "prob_D"], MC_OK),
+            "p0.. columns, no label": (["file", "p0", "p1", "p2", "p3"], [[r[0], *r[2:]] for r in MC_OK]),
+            "one list column": (["file", "label", "probs"], [[r[0], r[1], json.dumps(r[2:])] for r in MC_OK]),
+            "labels as names": (MC_HDR, [[r[0], MC_CLASSES[r[1]], *r[2:]] for r in MC_OK]),
+            "ids without extension": (MC_HDR, [[r[0][:-4], *r[1:]] for r in MC_OK]),
+            "identical duplicate + unknown row": (MC_HDR, MC_OK + [MC_OK[0], ["x.dcm", 0, 1, 0, 0, 0]]),
+        }
+        for name, (hdr, rows) in variants.items():
+            with self.subTest(name):
+                code, res, out = run_eval(MULTI, MC_GT, hdr, rows, MC_CLASSES)
+                self.assertEqual(code, 0, out)
+                self.assertEqual(res["metrics"], want)
+
+    def test_logits_and_unnormalised_rows(self):
+        logits = [[r[0], r[1], *[math.log(p) for p in r[2:]]] for r in MC_OK]  # softmax(log p) = p
+        code, res, out = run_eval(MULTI, MC_GT, MC_HDR, logits, MC_CLASSES)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(res["predictions_format"]["probability_transform"], "softmax")
+        want = run_eval(MULTI, MC_GT, MC_HDR, MC_OK, MC_CLASSES)[1]["metrics"]
+        self.assertAlmostEqual(res["metrics"]["auc"], want["auc"])
+        halved = [[r[0], r[1], *[p / 2 for p in r[2:]]] for r in MC_OK]  # sums to 0.5: re-normalised
+        code, res, out = run_eval(MULTI, MC_GT, MC_HDR, halved, MC_CLASSES)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(res["predictions_format"]["probability_transform"], "renormalised")
+        self.assertEqual(res["metrics"], want)
+
+    def test_labels_only_omits_auc(self):
+        code, res, out = run_eval(MULTI, MC_GT, ["file", "label"], [r[:2] for r in MC_OK], MC_CLASSES)
+        self.assertEqual(code, 0, out)
+        self.assertIsNone(res["metrics"]["auc"])
+        self.assertAlmostEqual(res["metrics"]["accuracy"], 3 / 5)
 
 
 if __name__ == "__main__":

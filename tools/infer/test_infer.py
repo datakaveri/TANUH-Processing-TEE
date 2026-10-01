@@ -66,10 +66,30 @@ class OnnxSpec(unittest.TestCase):
         s = self.load().spec
         self.assertEqual((s.channels, s.layout, s.dtype, s.resize, s.fixed_batch), (1, "NHWC", "uint8", "bilinear", 4))
 
-    def test_dynamic_height_width_rejected(self):
+    def test_dynamic_height_width_needs_a_size(self):
         tiny_onnx(self.dir / "model.onnx", ["batch", 3, "h", "w"])
         with self.assertRaises(infer.ModelError):
             self.load()
+        (self.dir / "input_spec.json").write_text(json.dumps({"input_size": [20, 10], "interpolation": "cubic"}))
+        s = self.load().spec
+        self.assertEqual((s.channels, s.height, s.width, s.layout, s.resize), (3, 20, 10, "NCHW", "bicubic"))
+
+    def test_uploaded_spec_overrides_metadata_resize(self):
+        tiny_onnx(self.dir / "model.onnx", ["batch", 3, 16, 16], resize="bicubic")
+        (self.dir / "input_spec.json").write_text(json.dumps({"resize": "bilinear"}))
+        rt = self.load()
+        self.assertEqual(rt.spec.resize, "bilinear")
+        self.assertIn("input_spec.json", rt.spec_source)
+
+    def test_uploaded_spec_contradicting_the_model_rejected(self):
+        tiny_onnx(self.dir / "model.onnx", ["batch", 3, 16, 16])
+        for spec in ({"input_size": 224}, {"channels": 1}, {"dtype": "uint8"}):
+            with self.subTest(spec):
+                (self.dir / "input_spec.json").write_text(json.dumps(spec))
+                with self.assertRaises(infer.ModelError):
+                    self.load()
+        (self.dir / "input_spec.json").write_text(json.dumps({"input_shape": [1, 3, 16, 16]}))  # agrees
+        self.assertEqual(self.load().spec.height, 16)
 
     def test_unknown_resize_rejected(self):
         tiny_onnx(self.dir / "model.onnx", ["batch", 3, 8, 8], resize="lanczos")
@@ -102,35 +122,68 @@ class TorchScriptSpec(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
 
-    def save(self, extra=None):
+    def save(self, extra=None, name="tanuh.json"):
         import torch
 
         class M(torch.nn.Module):
             def forward(self, x):
                 return x.mean(dim=(1, 2, 3)).unsqueeze(1)
 
-        files = {"tanuh.json": json.dumps(extra)} if extra is not None else {}
+        files = {name: json.dumps(extra)} if extra is not None else {}
         torch.jit.save(torch.jit.script(M()), str(self.dir / "model.pt"), _extra_files=files)
 
-    def test_spec_read_without_loading(self):
-        self.save({"input_shape": [3, 32, 24], "resize": "bicubic"})
-        s = infer.read_torchscript_spec(self.dir / "model.pt")
-        self.assertEqual((s.channels, s.height, s.width, s.layout, s.resize), (3, 32, 24, "NCHW", "bicubic"))
+    def spec(self):
+        return infer.torchscript_spec(self.dir, self.dir / "model.pt")
 
-    def test_missing_tanuh_json_rejected(self):
+    def upload(self, spec):
+        (self.dir / "input_spec.json").write_text(json.dumps(spec))
+
+    def test_embedded_spec_read_without_loading(self):
+        self.save({"input_shape": [3, 32, 24], "resize": "bicubic"})
+        s, source = self.spec()
+        self.assertEqual((s.channels, s.height, s.width, s.layout, s.resize), (3, 32, 24, "NCHW", "bicubic"))
+        self.assertEqual(source, "embedded tanuh.json")
+
+    def test_embedded_under_another_name(self):
+        self.save({"image_size": 64}, name="input_spec.json")
+        self.assertEqual(self.spec()[0].height, 64)
+
+    def test_plain_model_with_uploaded_spec(self):
+        self.save()  # torch.jit.save with nothing extra
+        self.upload({"input_size": [48, 40]})
+        s, source = self.spec()
+        self.assertEqual((s.channels, s.height, s.width, s.layout, s.dtype, s.resize),
+                         (3, 48, 40, "NCHW", "float32", "bilinear"))
+        self.assertEqual(source, "input_spec.json")
+
+    def test_uploaded_spec_wins_over_embedded(self):
+        self.save({"input_shape": [3, 32, 32], "resize": "bicubic"})
+        self.upload({"size": 96})
+        s, source = self.spec()
+        self.assertEqual((s.height, s.resize), (96, "bicubic"))
+        self.assertEqual(source, "embedded tanuh.json + input_spec.json")
+
+    def test_no_size_anywhere_rejected(self):
         self.save()
         with self.assertRaises(infer.ModelError):
-            infer.read_torchscript_spec(self.dir / "model.pt")
-
-    def test_bad_input_shape_rejected(self):
-        self.save({"input_shape": [3, "h", 24]})
+            self.spec()
+        self.upload({"resize": "bicubic"})  # a spec without the size is not enough
         with self.assertRaises(infer.ModelError):
-            infer.read_torchscript_spec(self.dir / "model.pt")
+            self.spec()
+
+    def test_bad_specs_rejected(self):
+        self.save()
+        for spec in ({"input_shape": [3, "h", 24]}, {"input_size": 0}, {"mean": [0.5], "input_size": 8},
+                     {"input_size": 8, "resize": "lanczos"}, {"input_size": 8, "layout": "CHWN"}, [224, 224]):
+            with self.subTest(spec):
+                self.upload(spec)
+                with self.assertRaises(infer.ModelError):
+                    self.spec()
 
     def test_non_torchscript_file_rejected(self):
         (self.dir / "model.pt").write_bytes(b"pickled state dict, not TorchScript")
         with self.assertRaises(infer.ModelError):
-            infer.read_torchscript_spec(self.dir / "model.pt")
+            self.spec()
 
     def test_runs_and_names_outputs(self):
         self.save({"input_shape": [3, 8, 8]})
@@ -138,6 +191,26 @@ class TorchScriptSpec(unittest.TestCase):
         out = rt.run(np.zeros((2, 3, 8, 8), np.float32))
         self.assertEqual(list(out), ["output"])
         self.assertEqual(out["output"].shape, (2, 1))
+
+
+class ParseInputSpec(unittest.TestCase):
+    def test_forms(self):
+        cases = [
+            ({"input_shape": [3, 224, 200]}, dict(layout="NCHW", channels=3, height=224, width=200)),
+            ({"shape": [1, 3, 224, 200]}, dict(layout="NCHW", channels=3, height=224, width=200)),
+            ({"input_shape": [224, 200, 1]}, dict(layout="NHWC", channels=1, height=224, width=200)),
+            ({"input_shape": [3, 3, 3], "data_format": "channels_last"}, dict(layout="NHWC", channels=3, height=3, width=3)),
+            ({"image_size": 256}, dict(height=256, width=256)),
+            ({"Input Size": [256, 128]}, dict(height=256, width=128)),
+            ({"size": {"height": 10, "width": 20}}, dict(height=10, width=20)),
+            ({"height": 10, "width": 20, "num_channels": 1}, dict(height=10, width=20, channels=1)),
+            ({"resample": 3, "dtype": "fp16"}, dict(resize="bicubic", dtype="float16")),
+            ({"interpolation": "INTER_LINEAR"}, dict(resize="bilinear")),
+            ({}, {}),
+        ]
+        for raw, want in cases:
+            with self.subTest(raw):
+                self.assertEqual(infer.parse_input_spec(raw, "t"), want)
 
 
 class HuggingFaceValidation(unittest.TestCase):
@@ -179,9 +252,44 @@ class InputContract(unittest.TestCase):
         self.assertEqual(t.shape, (3, 8, 8))
         self.assertAlmostEqual(float(t.max()), 1.0)
 
-    def test_unsupported_file_type(self):
-        with self.assertRaises(infer.DecodeError):
-            infer.decode(Path("scan.nii"))
+    def test_undecodable_file(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "scan.nii").write_bytes(b"\x00" * 400)
+        for p in (d / "scan.nii", d / "missing.jpg"):
+            with self.subTest(p.name), self.assertRaises(infer.DecodeError):
+                infer.decode(p)
+
+    def test_decodes_by_content_not_extension(self):
+        import cv2
+        d = Path(tempfile.mkdtemp())
+        img = np.zeros((6, 8, 3), np.uint8)
+        img[..., 2] = 255  # red in OpenCV's BGR
+        for name, ext in (("photo.dat", ".png"), ("noext", ".png"), ("a.bmp", ".bmp"), ("a.tif", ".tiff")):
+            with self.subTest(name):
+                ok, buf = cv2.imencode(ext, img)
+                (d / name).write_bytes(buf.tobytes())
+                self.assertEqual(infer.file_kind(d / name), "image")
+                out = infer.decode(d / name)
+                self.assertEqual(out.shape, (6, 8, 3))
+                self.assertEqual(tuple(out[0, 0]), (255, 0, 0))  # RGB
+
+    def test_dicom_without_extension(self):
+        from pydicom.dataset import Dataset, FileMetaDataset
+        from pydicom.uid import ExplicitVRLittleEndian, generate_uid
+        d = Path(tempfile.mkdtemp())
+        meta = FileMetaDataset()
+        meta.TransferSyntaxUID = ExplicitVRLittleEndian
+        meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.7"
+        meta.MediaStorageSOPInstanceUID = generate_uid()
+        ds = Dataset()
+        ds.file_meta = meta
+        ds.Rows, ds.Columns, ds.SamplesPerPixel, ds.BitsAllocated, ds.BitsStored, ds.HighBit = 4, 5, 1, 16, 16, 15
+        ds.PixelRepresentation, ds.PhotometricInterpretation = 0, "MONOCHROME2"
+        ds.PixelData = np.arange(20, dtype=np.uint16).reshape(4, 5).tobytes()
+        ds.save_as(str(d / "IM0001"), enforce_file_format=True)
+        self.assertEqual(infer.file_kind(d / "IM0001"), "dicom")
+        out = infer.decode(d / "IM0001")
+        self.assertEqual((out.shape, int(out.min()), int(out.max())), ((4, 5, 3), 0, 255))
 
     def test_output_names_are_made_safe(self):
         m = infer.safe_output_names(["ids", "out/logits:0", "out_logits_0"])
@@ -192,19 +300,19 @@ class InputContract(unittest.TestCase):
 class EndToEnd(unittest.TestCase):
     """Run infer.py as the TEE does: fixed-batch padding, output order, exit codes."""
 
-    def run_infer(self, model_shape, images):
+    def run_infer(self, model_shape, images, ids=None):
         d = Path(tempfile.mkdtemp())
         (d / "model").mkdir()
         tiny_onnx(d / "model" / "model.onnx", model_shape)
-        paths = []
+        lines = []
         for i, value in enumerate(images):
             p = d / f"img{i}.jpg"
             if value is None:
                 p.write_bytes(b"corrupt")
             else:
                 write_image(p, value)
-            paths.append(str(p))
-        (d / "inputs.txt").write_text("\n".join(paths))
+            lines.append(f"{ids[i]}\t{p}" if ids else str(p))
+        (d / "inputs.txt").write_text("\n".join(lines))
         proc = subprocess.run([sys.executable, str(INFER), "--format", "onnx", "--model-dir", str(d / "model"),
                                "--inputs", str(d / "inputs.txt"), "--output-dir", str(d / "raw")],
                               capture_output=True, text=True)
@@ -218,6 +326,12 @@ class EndToEnd(unittest.TestCase):
         np.testing.assert_allclose(npz["y"], [0, 0.2, 0.4, 0.6, 0.8], atol=0.01)
         meta = json.loads((d / "raw" / "meta.json").read_text())
         self.assertEqual(meta["input_spec"]["fixed_batch"], 4)
+
+    def test_ids_come_from_inputs(self):
+        ids = ["Suspicious/a.jpg", "Non-Suspicious/a.jpg"]  # same file name, two folders
+        proc, d = self.run_infer(["b", 3, 8, 8], [10, 20], ids=ids)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([str(x) for x in np.load(d / "raw" / "raw_outputs.npz")["ids"]], ids)
 
     def test_corrupt_input_exits_14(self):
         proc, _ = self.run_infer(["b", 3, 8, 8], [10, None])

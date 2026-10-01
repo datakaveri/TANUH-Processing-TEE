@@ -45,8 +45,10 @@ type materialized struct {
 	modelSHA256   string
 	weightsSHA256 string
 	adaptorSHA256 string
-	keycloakToken string
-	bufferJobURL  string
+	// inputSpecSHA256 is set when an input_spec.json was uploaded.
+	inputSpecSHA256 string
+	keycloakToken   string
+	bufferJobURL    string
 }
 
 // RunJob executes the full secure-job pipeline for an accepted payload and
@@ -142,30 +144,29 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 		return err
 	}
 
-	// 4. Decrypt the dataset into a per-job temp folder. It holds the data
-	//    provider's data, so it is wiped when the job finishes either way.
+	// 4. Decrypt the ground truth, match it to the dataset's files, and decrypt
+	//    those files into a per-job temp folder. It holds the data provider's
+	//    data, so it is wiped when the job finishes either way.
 	datasetDir := filepath.Join(job.runtimeDir, "dataset")
 	defer os.RemoveAll(datasetDir)
 	var ds *dataset
 	if err := timed("dataset", func() (err error) {
-		ds, err = m.fetchAndDecryptDataset(ctx, job.datasetUUID, datasetDir)
+		ds, err = m.fetchAndDecryptDataset(ctx, job.datasetUUID, datasetDir, spec.ClassNames)
 		return err
 	}); err != nil {
 		return err
 	}
 
-	// 5. Ground truth → the ordered input list; every row must have its file.
-	rows, err := groundtruth.ParseFile(ds.GroundTruth, len(spec.ClassNames))
-	if err != nil {
-		return fmt.Errorf("pipeline: %w", err)
-	}
-	paths, err := groundtruth.Resolve(rows, ds.Files)
-	if err != nil {
-		return fmt.Errorf("pipeline: %w", err)
+	// 5. The canonical ground truth (file = path in the dataset, label =
+	//    class index) for the evaluator, and the input list for inference.
+	rows := ds.Match.Rows
+	groundTruthPath := filepath.Join(job.runtimeDir, "ground_truth.csv")
+	if err := groundtruth.WriteCanonical(groundTruthPath, rows); err != nil {
+		return err
 	}
 	inputsPath := filepath.Join(job.runtimeDir, "inputs.txt")
-	if err := groundtruth.WriteInputs(inputsPath, paths); err != nil {
-		return err
+	if err := groundtruth.WriteInputs(inputsPath, rows, func(f string) string { return ds.Paths[f] }); err != nil {
+		return fmt.Errorf("pipeline: %w", err)
 	}
 	specPath := filepath.Join(job.runtimeDir, "dataset_spec.json")
 	if err := writeJSON(specPath, map[string]any{
@@ -176,7 +177,9 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 	}); err != nil {
 		return err
 	}
-	log.Printf("pipeline: secure job %s: %d %s samples, %d classes", job.jobID, len(paths), ds.Modality, len(spec.ClassNames))
+	log.Printf("pipeline: secure job %s: %d %s samples, %d classes (ground truth %s: %s, id column %q, label column %q, labels by %s, matched by %v)",
+		job.jobID, len(rows), ds.Modality, len(spec.ClassNames), ds.GroundTruth, ds.Table.Format,
+		ds.Table.IDColumn, ds.Table.LabelColumn, ds.Match.LabelMode, ds.Match.MatchedBy)
 
 	// 6. The three Python stages.
 	rawDir := filepath.Join(job.runtimeDir, "raw")
@@ -206,7 +209,10 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 	}); err != nil {
 		return err
 	}
-	predictionsPath := filepath.Join(predDir, "predictions.csv")
+	predictionsPath, err := findPredictions(predDir)
+	if err != nil {
+		return err
+	}
 	if err := checkPredictions(predictionsPath); err != nil {
 		return err
 	}
@@ -214,7 +220,7 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 		return eval.RunStage(ctx, eval.Stage{
 			Name:   eval.StageEvaluator,
 			Script: ev.Path,
-			Args: []string{"--predictions", predictionsPath, "--ground-truth", ds.GroundTruth,
+			Args: []string{"--predictions", predictionsPath, "--ground-truth", groundTruthPath,
 				"--spec", specPath, "--results", resultsPath},
 			Dir:     job.runtimeDir,
 			Timeout: m.cfg.EvaluatorTimeout,
@@ -247,7 +253,21 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 	results["model_sha256"] = job.modelSHA256
 	results["weights_sha256"] = job.weightsSHA256
 	results["adaptor_sha256"] = job.adaptorSHA256
+	results["input_spec_sha256"] = job.inputSpecSHA256
 	results["evaluator"] = map[string]any{"origin": ev.Origin, "sha256": ev.SHA256}
+	results["ground_truth"] = map[string]any{ // counts only: no sample names leave the TEE log
+		"file":         ds.GroundTruth,
+		"format":       ds.Table.Format,
+		"id_column":    ds.Table.IDColumn,
+		"label_column": ds.Table.LabelColumn,
+		"label_mode":   ds.Match.LabelMode,
+		"rows":         ds.Match.Total,
+		"scored":       len(rows),
+		"unmatched":    len(ds.Match.Unmatched),
+		"unlabeled":    ds.Match.Unlabeled,
+		"matched_by":   ds.Match.MatchedBy,
+	}
+	results["modality"] = ds.Modality
 	results["leaderboard_metrics"] = lbMetrics
 	results["stage_seconds"] = timings
 	results["elapsed_seconds"] = elapsed
@@ -288,7 +308,7 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 //
 //	{"payload_version": 2, "job_id", "dataset_id", "model_format",
 //	 "keycloak_token", "buffer_job_url",
-//	 "artifacts": {"model"|"weights"|"adaptor": {"sha256", "base64"}}}
+//	 "artifacts": {"model"|"weights"|"adaptor"|"input_spec": {"sha256", "base64"}}}
 //
 // Every artifact must carry a SHA-256 (committed by the browser at submit and
 // re-checked by the Buffer) that matches its bytes. Confidentiality in transit
@@ -330,7 +350,12 @@ func (m *Manager) materialize(payload map[string]any) (*materialized, error) {
 	if err != nil {
 		return nil, err
 	}
+	inputSpec, inputSpecSHA, err := decodeArtifact(artifacts, "input_spec", false)
+	if err != nil {
+		return nil, err
+	}
 	job.modelSHA256, job.weightsSHA256, job.adaptorSHA256 = modelSHA, weightsSHA, adaptorSHA
+	job.inputSpecSHA256 = inputSpecSHA
 
 	job.jobDir = m.jobDir(job.jobID)
 	job.runtimeDir = filepath.Join(job.jobDir, "runtime")
@@ -341,7 +366,7 @@ func (m *Manager) materialize(payload map[string]any) (*materialized, error) {
 			return nil, err
 		}
 	}
-	if err := modelpkg.Place(job.modelFormat, model, weights, job.modelDir); err != nil {
+	if err := modelpkg.Place(job.modelFormat, model, weights, inputSpec, job.modelDir); err != nil {
 		return nil, err
 	}
 	job.adaptorPath = filepath.Join(scriptsDir, "adaptor.py")
@@ -390,7 +415,35 @@ func decodeArtifact(artifacts map[string]any, slot string, required bool) ([]byt
 	return data, expected, nil
 }
 
-// checkPredictions confirms the adaptor produced a usable predictions.csv.
+// findPredictions returns the adaptor's output table: predictions.csv (or
+// .tsv) in the predictions folder, else the only .csv / .tsv file there.
+func findPredictions(dir string) (string, error) {
+	for _, name := range []string{"predictions.csv", "predictions.tsv"} {
+		if p := filepath.Join(dir, name); fileExists(p) {
+			return p, nil
+		}
+	}
+	var tables []string
+	for _, pattern := range []string{"*.csv", "*.tsv"} {
+		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+		tables = append(tables, matches...)
+	}
+	switch len(tables) {
+	case 1:
+		return tables[0], nil
+	case 0:
+		return "", &eval.AdaptorOutputError{Msg: "the adaptor did not write predictions/predictions.csv"}
+	}
+	return "", &eval.AdaptorOutputError{Msg: fmt.Sprintf(
+		"the adaptor wrote %d tables to predictions/ and none is named predictions.csv", len(tables))}
+}
+
+func fileExists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
+}
+
+// checkPredictions confirms the adaptor produced a usable predictions table.
 func checkPredictions(path string) error {
 	info, err := os.Lstat(path)
 	switch {

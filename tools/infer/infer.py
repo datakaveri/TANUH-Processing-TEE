@@ -11,28 +11,35 @@ model provider's adaptor (stage 2) and the bucket evaluator (stage 3) do that.
                      [--batch-size 8]
 
   --model-dir   ONNX:         model.onnx (+ model.onnx.data when the model has external weights)
-                TorchScript:  model.pt   (saved with torch.jit.save, carrying extra/tanuh.json)
+                TorchScript:  model.pt   (saved with torch.jit.save)
                 Hugging Face: hf/        (config.json, *.safetensors, preprocessor_config.json)
-  --inputs      one input file path per line (data files, in ground-truth order)
+                ONNX / TorchScript may also hold input_spec.json, uploaded next to the model
+  --inputs      one "<id>\t<path>" line per sample, in ground-truth order; <id> is
+                the sample's path in the dataset (a line without a tab: id = file name)
   --output-dir  receives raw_outputs.npz (`ids` + one array per model output) and meta.json
 
 Platform input contract (ONNX and TorchScript) — the platform turns every file
 into exactly the tensor the model declares, so no preprocessing script exists:
-  1. decode:   images (.jpg/.jpeg/.png) -> RGB uint8; DICOM (.dcm) -> middle frame,
-               MONOCHROME1 inverted, min-max to 0..255, grey -> 3 channels
+  1. decode:   by content, not extension. DICOM -> middle frame, MONOCHROME1
+               inverted, min-max to 0..255, grey -> 3 channels; images (JPEG, PNG,
+               TIFF, BMP, WebP, GIF) -> RGB uint8
   2. resize:   to the model's H x W; "bilinear" (default, Pillow) or "bicubic" (OpenCV)
   3. channels: 1 (grey) or 3 (RGB) and layout NCHW or NHWC, as the model declares
   4. dtype:    float -> [0,1]; uint8 -> 0..255
 Anything model-specific (normalisation, colour balancing, channel order) must be
 inside the model. Hugging Face models use their own preprocessor_config.json instead.
 
-Where the declaration comes from:
-  ONNX         the model's input signature + metadata_props key "tanuh.resize"
-  TorchScript  JSON embedded at save time:
+Where the declaration comes from (later wins):
+  ONNX         the model's input signature, metadata_props key "tanuh.resize",
+               then input_spec.json (resize; H x W for a model with dynamic size)
+  TorchScript  JSON embedded at save time as extra/tanuh.json or extra/input_spec.json,
                  torch.jit.save(m, f, _extra_files={"tanuh.json": json.dumps(
-                     {"input_shape": [3, 256, 256], "layout": "NCHW",
-                      "dtype": "float32", "resize": "bicubic"})})
+                     {"input_shape": [3, 256, 256], "resize": "bicubic"})})
+               then input_spec.json. At least the input size must come from one of them.
   Hugging Face preprocessor_config.json (applied by transformers' AutoImageProcessor)
+The spec's keys are flexible: input_shape / shape / input_size / image_size / size
+(an int, [H, W], [C, H, W], [N, C, H, W] or {"height", "width"}), height, width,
+channels, layout / data_format, dtype, resize / interpolation / resample.
 
 Exit codes (the Processing TEE maps them to leaderboard error categories):
   0   raw outputs written
@@ -59,9 +66,11 @@ EXIT_MODEL = 13
 EXIT_DECODE = 14
 
 DEFAULT_BATCH = 8
-IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
-DICOM_EXTS = {".dcm"}
+DICOM_EXTS = {".dcm", ".dicom", ".dic"}
+IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG", b"II*\x00", b"MM\x00*", b"BM", b"GIF8")
 RESIZE_METHODS = ("bilinear", "bicubic")
+SPEC_FILE = "input_spec.json"                       # uploaded next to the model
+EMBEDDED_SPEC_NAMES = ("tanuh.json", "input_spec.json")  # TorchScript extra/ files
 CUDA_KEYWORDS = ("cuda", "cudnn", "cublas", "nvidia", "out of memory", "gpu")
 FORMATS = ("onnx", "torchscript", "huggingface")
 
@@ -92,9 +101,14 @@ def is_cuda_error(exc):
 def decode_image(path):
     import cv2
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if img is None:
-        raise DecodeError(f"cannot decode image {Path(path).name}")
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if img is not None:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    try:  # formats OpenCV does not read (GIF, some TIFF variants)
+        from PIL import Image
+        with Image.open(path) as im:
+            return np.asarray(im.convert("RGB"))
+    except Exception as exc:
+        raise DecodeError(f"cannot decode image {Path(path).name}") from exc
 
 
 def decode_dicom(path):
@@ -120,19 +134,36 @@ def decode_dicom(path):
     return arr[..., :3]
 
 
+def file_kind(path):
+    """"dicom", "image" or "unknown", from the file's first bytes (the
+    extension only decides for a DICOM file without its "DICM" preamble)."""
+    with open(path, "rb") as f:
+        head = f.read(132)
+    if len(head) >= 132 and head[128:132] == b"DICM":
+        return "dicom"
+    if head.startswith(IMAGE_MAGIC) or (head[:4] == b"RIFF" and head[8:12] == b"WEBP"):
+        return "image"
+    if Path(path).suffix.lower() in DICOM_EXTS:
+        return "dicom"
+    return "unknown"
+
+
 def decode(path):
     """Return the file as uint8 (H, W, 3) RGB, or raise DecodeError."""
-    ext = Path(path).suffix.lower()
     try:
-        if ext in IMAGE_EXTS:
+        kind = file_kind(path)
+        if kind == "dicom":
+            return decode_dicom(path)
+        if kind == "image":
             return decode_image(path)
-        if ext in DICOM_EXTS:
+        try:  # unknown: an image format without a known signature, else a DICOM without preamble
+            return decode_image(path)
+        except DecodeError:
             return decode_dicom(path)
     except DecodeError:
         raise
     except Exception as exc:
         raise DecodeError(f"cannot decode {Path(path).name}: {exc}") from exc
-    raise DecodeError(f"unsupported input file type {ext!r} ({Path(path).name})")
 
 
 # ── input contract ─────────────────────────────────────────────────────────────
@@ -159,6 +190,106 @@ class InputSpec:
         if self.resize not in RESIZE_METHODS:
             raise ModelError(f"resize must be one of {RESIZE_METHODS}, declared {self.resize!r}")
         return self
+
+
+RESIZE_ALIASES = {"bilinear": "bilinear", "linear": "bilinear", "inter_linear": "bilinear", "2": "bilinear",
+                  "bicubic": "bicubic", "cubic": "bicubic", "inter_cubic": "bicubic", "3": "bicubic"}
+DTYPE_ALIASES = {"float32": "float32", "float": "float32", "fp32": "float32", "f32": "float32",
+                 "float16": "float16", "half": "float16", "fp16": "float16", "f16": "float16",
+                 "uint8": "uint8", "u8": "uint8"}
+LAYOUT_ALIASES = {"nchw": "NCHW", "chw": "NCHW", "channels_first": "NCHW",
+                  "nhwc": "NHWC", "hwc": "NHWC", "channels_last": "NHWC"}
+SHAPE_KEYS = ("input_shape", "shape", "input_size", "image_size", "img_size", "size", "resolution")
+# Preprocessing the platform does not apply: silently ignoring these would feed
+# the model differently from what its author expects.
+UNSUPPORTED_SPEC_KEYS = {"mean", "std", "normalize", "normalization", "image_mean", "image_std",
+                         "channel_order", "color_order", "colour_order", "bgr"}
+
+
+def _norm_key(k):
+    return re.sub(r"[^a-z0-9]+", "_", str(k).lower()).strip("_")
+
+
+def _positive_int(v, what, source):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != int(v) or int(v) <= 0:
+        raise ModelError(f"{source}: {what} must be a positive whole number, got {v!r}")
+    return int(v)
+
+
+def parse_input_spec(raw, source):
+    """Read a flexible input declaration into {channels, height, width,
+    layout, dtype, resize}, holding only what it states."""
+    if not isinstance(raw, dict):
+        raise ModelError(f"{source} must be a JSON object")
+    keys = {_norm_key(k): v for k, v in raw.items()}
+    unsupported = sorted(k for k in keys if k in UNSUPPORTED_SPEC_KEYS)
+    if unsupported:
+        raise ModelError(f"{source}: {unsupported} are not applied by the platform; "
+                         f"put that preprocessing inside the model")
+    out = {}
+    layout = keys.get("layout", keys.get("data_format"))
+    if layout is not None:
+        out["layout"] = LAYOUT_ALIASES.get(str(layout).lower())
+        if out["layout"] is None:
+            raise ModelError(f"{source}: layout must be NCHW or NHWC, got {layout!r}")
+
+    shape = next((keys[k] for k in SHAPE_KEYS if k in keys), None)
+    if isinstance(shape, (int, float)) and not isinstance(shape, bool):
+        out["height"] = out["width"] = _positive_int(shape, "size", source)
+    elif isinstance(shape, dict):
+        dims = {_norm_key(k): v for k, v in shape.items()}
+        h, w = dims.get("height", dims.get("h")), dims.get("width", dims.get("w"))
+        if h is None or w is None:
+            raise ModelError(f"{source}: size object needs height and width, got {shape!r}")
+        out["height"], out["width"] = _positive_int(h, "height", source), _positive_int(w, "width", source)
+    elif isinstance(shape, (list, tuple)):
+        dims = list(shape)
+        if len(dims) == 4:
+            dims = dims[1:]  # [N, ...]: the batch size is not part of the spec
+        dims = [_positive_int(d, "every dimension", source) for d in dims]
+        if len(dims) == 3:
+            lay = out.get("layout")
+            if lay is None:  # channels are the 1-or-3 end
+                lay = "NHWC" if dims[2] in (1, 3) and dims[0] not in (1, 3) else "NCHW"
+                out["layout"] = lay
+            c, h, w = dims if lay == "NCHW" else (dims[2], dims[0], dims[1])
+            out.update(channels=c, height=h, width=w)
+        elif len(dims) == 2:
+            out["height"], out["width"] = dims
+        elif len(dims) == 1:
+            out["height"] = out["width"] = dims[0]
+        else:
+            raise ModelError(f"{source}: input shape must be [H, W], [C, H, W] or [N, C, H, W], got {shape!r}")
+    elif shape is not None:
+        raise ModelError(f"{source}: cannot read input size {shape!r}")
+    for key in ("height", "width"):
+        if key in keys:
+            out[key] = _positive_int(keys[key], key, source)
+    for key in ("channels", "num_channels", "in_channels"):
+        if key in keys:
+            out["channels"] = _positive_int(keys[key], "channels", source)
+    if "dtype" in keys:
+        out["dtype"] = DTYPE_ALIASES.get(str(keys["dtype"]).lower())
+        if out["dtype"] is None:
+            raise ModelError(f"{source}: dtype must be float32, float16 or uint8, got {keys['dtype']!r}")
+    resize_value = next((keys[k] for k in ("resize", "interpolation", "resample", "resize_method") if k in keys), None)
+    if resize_value is not None:
+        out["resize"] = RESIZE_ALIASES.get(_norm_key(resize_value))
+        if out["resize"] is None:
+            raise ModelError(f"{source}: resize must be bilinear or bicubic, got {resize_value!r}")
+    return out
+
+
+def read_uploaded_spec(model_dir):
+    """input_spec.json uploaded next to the model, or {} when there is none."""
+    path = model_dir / SPEC_FILE
+    if not path.exists():
+        return {}, None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ModelError(f"{SPEC_FILE} is not valid JSON: {exc}") from exc
+    return parse_input_spec(raw, SPEC_FILE), SPEC_FILE
 
 
 def resize(img, width, height, method):
@@ -241,10 +372,18 @@ class OnnxRuntime:
             raise ModelError(f"model must have exactly one input, found {len(inputs)}")
         self.input_name = inputs[0].name
         meta = self.session.get_modelmeta().custom_metadata_map or {}
-        self.spec = self._spec(inputs[0], meta.get("tanuh.resize", "bilinear"))
+        declared = parse_input_spec({"resize": meta["tanuh.resize"]}, "metadata tanuh.resize") \
+            if "tanuh.resize" in meta else {}
+        uploaded, uploaded_source = read_uploaded_spec(model_dir)
+        self.spec = self._spec(inputs[0], {**declared, **uploaded})
+        self.spec_source = " + ".join(["model input signature"] + (["metadata tanuh.resize"] if declared else [])
+                                      + ([uploaded_source] if uploaded_source else []))
 
     @staticmethod
-    def _spec(inp, resize_method):
+    def _spec(inp, given):
+        """The model's input signature, completed (dynamic sizes) or refined
+        (resize) by the declared spec. A spec that contradicts a fixed
+        dimension of the model is an error, not a silent override."""
         shape = list(inp.shape)
         if len(shape) != 4:
             raise ModelError(f"input must be 4-D (batch, ...), declared {shape}")
@@ -252,44 +391,68 @@ class OnnxRuntime:
                  "tensor(uint8)": "uint8"}.get(inp.type)
         if dtype is None:
             raise ModelError(f"unsupported input type {inp.type}")
-        dims = [d if isinstance(d, int) else None for d in shape]
-        if dims[1] in (1, 3) and dims[2] and dims[3]:
-            layout, c, h, w = "NCHW", dims[1], dims[2], dims[3]
-        elif dims[3] in (1, 3) and dims[1] and dims[2]:
-            layout, c, h, w = "NHWC", dims[3], dims[1], dims[2]
+        if given.get("dtype") not in (None, dtype):
+            raise ModelError(f"the input spec says dtype={given['dtype']} but the model's input is {dtype}")
+        dims = [d if isinstance(d, int) and d > 0 else None for d in shape]
+        if given.get("layout"):
+            layout = given["layout"]
+        elif dims[3] in (1, 3) and dims[1] not in (1, 3):
+            layout = "NHWC"
         else:
-            raise ModelError(f"input must be NCHW or NHWC with a fixed height and width, declared {shape}")
-        fixed = dims[0] if dims[0] and dims[0] > 0 else None
-        return InputSpec(c, h, w, layout, dtype, resize_method, fixed).validate()
+            layout = "NCHW"
+        c, h, w = (dims[1], dims[2], dims[3]) if layout == "NCHW" else (dims[3], dims[1], dims[2])
+        for name, model_value in (("channels", c), ("height", h), ("width", w)):
+            if model_value is not None and given.get(name) not in (None, model_value):
+                raise ModelError(f"the input spec says {name}={given[name]} but the model's input is {shape}")
+        c = c or given.get("channels", 3)
+        h, w = h or given.get("height"), w or given.get("width")
+        if not h or not w:
+            raise ModelError(f"the model's input {shape} has a dynamic height/width; give the size in "
+                             f"{SPEC_FILE} (e.g. {{\"input_size\": [224, 224]}})")
+        fixed = dims[0]
+        return InputSpec(c, h, w, layout, dtype, given.get("resize") or "bilinear", fixed).validate()
 
     def run(self, batch):
         outs = self.session.run(None, {self.input_name: batch})
         return {o.name: np.asarray(v) for o, v in zip(self.session.get_outputs(), outs)}
 
 
-def read_torchscript_spec(model_path):
-    """Read extra/tanuh.json from the archive without executing anything."""
+def read_embedded_spec(model_path):
+    """The input declaration saved inside a TorchScript archive
+    (extra/tanuh.json or extra/input_spec.json), read without executing
+    anything; {} when there is none."""
     try:
         with zipfile.ZipFile(model_path) as zf:
             names = zf.namelist()
             if not any("/code/" in n for n in names) or not any(n.endswith("constants.pkl") for n in names):
                 raise ModelError("model.pt is not a TorchScript archive (save it with torch.jit.save)")
-            spec_entries = [n for n in names if n.endswith("/extra/tanuh.json")]
-            if not spec_entries:
-                raise ModelError("model.pt has no tanuh.json; save it with "
-                                 "torch.jit.save(m, f, _extra_files={'tanuh.json': ...})")
-            raw = json.loads(zf.read(spec_entries[0]).decode("utf-8"))
+            for wanted in EMBEDDED_SPEC_NAMES:
+                entries = [n for n in names if n.endswith("/extra/" + wanted)]
+                if entries:
+                    try:
+                        raw = json.loads(zf.read(entries[0]).decode("utf-8-sig"))
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        raise ModelError(f"embedded {wanted} is not valid JSON: {exc}") from exc
+                    return parse_input_spec(raw, f"embedded {wanted}"), f"embedded {wanted}"
     except zipfile.BadZipFile as exc:
-        raise ModelError("model.pt is not a TorchScript archive") from exc
-    except json.JSONDecodeError as exc:
-        raise ModelError(f"tanuh.json is not valid JSON: {exc}") from exc
-    shape = raw.get("input_shape")
-    if not (isinstance(shape, list) and len(shape) == 3 and all(isinstance(v, int) for v in shape)):
-        raise ModelError("tanuh.json input_shape must be [C, H, W] integers")
-    layout = raw.get("layout", "NCHW")
-    c, h, w = shape if layout == "NCHW" else (shape[2], shape[0], shape[1])
-    return InputSpec(c, h, w, layout, raw.get("dtype", "float32"),
-                     raw.get("resize", "bilinear"), None).validate()
+        raise ModelError("model.pt is not a TorchScript archive (save it with torch.jit.save)") from exc
+    return {}, None
+
+
+def torchscript_spec(model_dir, model_path):
+    """TorchScript files do not record their input size, so it comes from an
+    embedded declaration and/or input_spec.json uploaded next to the model
+    (the uploaded one wins). Everything but the size has a default."""
+    embedded, embedded_source = read_embedded_spec(model_path)
+    uploaded, uploaded_source = read_uploaded_spec(model_dir)
+    spec = {"channels": 3, "layout": "NCHW", "dtype": "float32", "resize": "bilinear", **embedded, **uploaded}
+    if "height" not in spec or "width" not in spec:
+        raise ModelError("the TorchScript model's input size is unknown: give it on the submit form "
+                         f"(uploaded as {SPEC_FILE}, e.g. {{\"input_size\": [224, 224]}}) or embed it with "
+                         "torch.jit.save(m, f, _extra_files={'tanuh.json': '{\"input_size\": [224, 224]}'})")
+    source = " + ".join(s for s in (embedded_source, uploaded_source) if s)
+    return InputSpec(spec["channels"], spec["height"], spec["width"], spec["layout"], spec["dtype"],
+                     spec["resize"], None).validate(), source
 
 
 def flatten_torch_outputs(out):
@@ -318,7 +481,7 @@ class TorchScriptRuntime:
         model_path = model_dir / "model.pt"
         if not model_path.exists():
             raise ModelError("model.pt not found")
-        self.spec = read_torchscript_spec(model_path)
+        self.spec, self.spec_source = torchscript_spec(model_dir, model_path)
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
@@ -387,6 +550,7 @@ class HuggingFaceRuntime:
         self.version = f"{transformers.__version__} (torch {torch.__version__})"
         self.providers = [f"torch:{self.device}"]
         self.spec = None  # the model's own image processor prepares inputs
+        self.spec_source = "preprocessor_config.json"
 
     def run(self, images):
         inputs = self.processor(images=images, return_tensors="pt")
@@ -449,6 +613,22 @@ def run_inference(runtime, paths, batch_size):
         raise ModelError(f"model output shape changes between batches: {exc}") from exc
 
 
+def read_inputs(path):
+    """(ids, paths) from "<id>\\t<path>" lines; a line without a tab is a bare
+    path whose id is its file name."""
+    ids, paths = [], []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        sample_id, sep, file_path = line.partition("\t")
+        if not sep:
+            file_path = sample_id.strip()
+            sample_id = Path(file_path).name
+        ids.append(sample_id)
+        paths.append(Path(file_path))
+    return ids, paths
+
+
 def main():
     ap = argparse.ArgumentParser(description="TANUH platform inference (stage 1)")
     ap.add_argument("--format", required=True, choices=FORMATS)
@@ -459,8 +639,7 @@ def main():
     args = ap.parse_args()
 
     started = time.perf_counter()
-    paths = [Path(line.strip()) for line in Path(args.inputs).read_text(encoding="utf-8").splitlines()
-             if line.strip()]
+    ids, paths = read_inputs(Path(args.inputs))
     if not paths:
         log("no inputs listed")
         return 1
@@ -470,7 +649,7 @@ def main():
         runtime = RUNTIMES[args.format](Path(args.model_dir))
         log(f"runtime={runtime.name} {runtime.version} device={runtime.device} providers={runtime.providers}")
         if runtime.spec:
-            log(f"input spec: {asdict(runtime.spec)}")
+            log(f"input spec: {asdict(runtime.spec)} (from {runtime.spec_source})")
         outputs = run_inference(runtime, paths, max(1, args.batch_size))
     except DecodeError as exc:
         log(f"DATASET DECODE ERROR: {exc}")
@@ -487,8 +666,7 @@ def main():
     names = safe_output_names(list(outputs))
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    ids = np.array([p.name for p in paths])
-    np.savez(out_dir / "raw_outputs.npz", ids=ids, **{names[k]: v for k, v in outputs.items()})
+    np.savez(out_dir / "raw_outputs.npz", ids=np.array(ids), **{names[k]: v for k, v in outputs.items()})
     meta = {
         "format": args.format,
         "runtime": runtime.name,
@@ -497,6 +675,7 @@ def main():
         "providers": runtime.providers,
         "num_inputs": len(paths),
         "input_spec": asdict(runtime.spec) if runtime.spec else None,
+        "input_spec_source": runtime.spec_source,
         "outputs": {names[k]: {"model_name": k, "shape": list(v.shape)} for k, v in outputs.items()},
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }

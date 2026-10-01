@@ -89,58 +89,117 @@ func TestMaterializeRejects(t *testing.T) {
 	}
 }
 
-func TestPlanDataset(t *testing.T) {
-	names := []string{
-		"u/a.jpg", "u/a.jpg.manifest.json",
-		"u/b.jpg", "u/b.jpg.manifest.json",
-		"u/ground_truth.csv", "u/ground_truth.csv.manifest.json",
-		"u/evaluation_script.py", "u/evaluation_script.py.manifest.json", // legacy upload: skipped, never decrypted
-		"u/notes.txt", // plaintext, no manifest: ignored
+// encrypted lists each name with its manifest, as the UI uploads them.
+func encrypted(n ...string) []string {
+	var out []string
+	for _, x := range n {
+		out = append(out, x, x+".manifest.json")
 	}
-	data, gt, modality, err := planDataset(names)
+	return out
+}
+
+func rels(objs []datasetObject) []string {
+	out := make([]string, len(objs))
+	for i, o := range objs {
+		out[i] = o.Rel
+	}
+	return out
+}
+
+func TestPlanDatasetNestedFolders(t *testing.T) {
+	names := append(encrypted(
+		"u/ground_truth.csv",
+		"u/top.jpg",                     // next to the ground truth
+		"u/Suspicious/a.jpg",            // one folder deep
+		"u/batch1/Non-Suspicious/a.jpg", // same file name, two folders deep
+		"u/subject_00001/IM0001",        // DICOM without an extension
+		"u/sub/other.csv",               // a table in a subfolder is not the ground truth
+	), "u/notes.txt", "u/dataset.json.enc", // no manifest: not an encrypted object, ignored
+		"u/gone.jpg.manifest.json") // manifest whose object is missing: ignored
+	data, gt, err := planDataset(names, "u/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if modality != "image" || len(data) != 2 || data[0].Name != "a.jpg" || gt.Name != "ground_truth.csv" {
-		t.Fatalf("data=%+v gt=%+v modality=%s", data, gt, modality)
+	want := "Suspicious/a.jpg,batch1/Non-Suspicious/a.jpg,sub/other.csv,subject_00001/IM0001,top.jpg"
+	if gt.Rel != "ground_truth.csv" || strings.Join(rels(data), ",") != want {
+		t.Fatalf("gt=%s data=%v", gt.Rel, rels(data))
 	}
-	for _, d := range data {
-		if strings.HasSuffix(d.Name, ".py") {
-			t.Fatal("python file planned for decryption")
-		}
+	if data[0].Cipher != "u/Suspicious/a.jpg" || data[0].Manifest != "u/Suspicious/a.jpg.manifest.json" {
+		t.Fatalf("object names %+v", data[0])
 	}
 }
 
-func TestPlanDatasetGroundTruthFallbackAndDICOM(t *testing.T) {
-	_, gt, modality, err := planDataset([]string{
-		"u/s1.dcm", "u/s1.dcm.manifest.json",
-		"u/labels.csv", "u/labels.csv.manifest.json", // the only CSV, uploaded under its own name
-	})
-	if err != nil || gt.Name != "labels.csv" || modality != "dicom" {
-		t.Fatalf("gt=%+v modality=%s err=%v", gt, modality, err)
+func TestPlanDatasetGroundTruthChoice(t *testing.T) {
+	cases := map[string]struct {
+		names []string
+		want  string
+	}{
+		"json ground truth":          {encrypted("u/a.jpg", "u/ground_truth.json"), "ground_truth.json"},
+		"named among several tables": {encrypted("u/a.jpg", "u/metadata.csv", "u/Ground-Truth.CSV"), "Ground-Truth.CSV"},
+		"labels file":                {encrypted("u/a.jpg", "u/stats.json", "u/labels.jsonl"), "labels.jsonl"},
+		"the only table":             {encrypted("u/a.dcm", "u/ocs_ground_truth_v2.csv"), "ocs_ground_truth_v2.csv"},
+	}
+	for name, c := range cases {
+		_, gt, err := planDataset(c.names, "u/")
+		if err != nil || gt.Rel != c.want {
+			t.Errorf("%s: gt=%q err=%v", name, gt.Rel, err)
+		}
 	}
 }
 
 func TestPlanDatasetRejects(t *testing.T) {
-	m := func(n ...string) []string {
-		var out []string
-		for _, x := range n {
-			out = append(out, x, x+".manifest.json")
-		}
-		return out
-	}
 	cases := map[string][]string{
-		"no ground truth":           m("u/a.jpg"),
-		"two csvs, no ground_truth": m("u/a.jpg", "u/x.csv", "u/y.csv"),
-		"mixed image and dicom":     m("u/a.jpg", "u/b.dcm", "u/ground_truth.csv"),
-		"duplicate names":           m("u/a.jpg", "u/sub/a.jpg", "u/ground_truth.csv"),
-		"no data files":             m("u/ground_truth.csv"),
-		"manifest without object":   {"u/a.jpg.manifest.json", "u/ground_truth.csv", "u/ground_truth.csv.manifest.json"},
+		"no ground truth":                 encrypted("u/a.jpg"),
+		"ground truth only in subfolder":  encrypted("u/a.jpg", "u/meta/ground_truth.csv"),
+		"two tables, none named":          encrypted("u/a.jpg", "u/x.csv", "u/y.json"),
+		"two ground truths":               encrypted("u/a.jpg", "u/ground_truth.csv", "u/ground_truth.json"),
+		"no data files":                   encrypted("u/ground_truth.csv"),
+		"only unusable paths besides gt":  encrypted("u/ground_truth.csv", "u/../x.jpg", "u/a//b.jpg"),
+		"manifests without their objects": {"u/a.jpg.manifest.json", "u/ground_truth.csv.manifest.json"},
 	}
 	for name, names := range cases {
-		if _, _, _, err := planDataset(names); err == nil {
+		if _, _, err := planDataset(names, "u/"); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestSafeRel(t *testing.T) {
+	for rel, want := range map[string]bool{
+		"a.jpg": true, "x/y/a.jpg": true, "a b/c.dcm": true,
+		"": false, "../a.jpg": false, "x/../a.jpg": false, "./a.jpg": false, "x//a.jpg": false, "/a.jpg": false, "x/": false,
+	} {
+		if safeRel(rel) != want {
+			t.Errorf("safeRel(%q) = %v", rel, !want)
+		}
+	}
+}
+
+func TestFileKind(t *testing.T) {
+	dicom := append(make([]byte, 128), []byte("DICM....")...)
+	cases := []struct {
+		head []byte
+		rel  string
+		want string
+	}{
+		{dicom, "IM0001", "dicom"}, // no extension: found by content
+		{dicom, "scan.jpg", "dicom"},
+		{[]byte("\x00\x00\x00raw"), "old.dcm", "dicom"}, // DICOM without preamble: by extension
+		{[]byte{0xFF, 0xD8, 0xFF, 0xE0}, "a", "image"},
+		{[]byte("\x89PNG\r\n"), "a.png", "image"},
+		{[]byte("II*\x00...."), "a.tif", "image"},
+		{[]byte("BM......"), "a.bmp", "image"},
+		{[]byte("RIFF\x00\x00\x00\x00WEBPVP8 "), "a.webp", "image"},
+		{[]byte("hello"), "notes.bin", "unknown"},
+	}
+	for _, c := range cases {
+		if got := fileKind(c.head, c.rel); got != c.want {
+			t.Errorf("fileKind(%q) = %s, want %s", c.rel, got, c.want)
+		}
+	}
+	if modalityOf(map[string]int{"image": 3}) != "image" || modalityOf(map[string]int{"image": 1, "dicom": 1}) != "mixed" ||
+		modalityOf(map[string]int{"dicom": 2, "unknown": 1}) != "dicom" {
+		t.Fatal("modalityOf")
 	}
 }
 
@@ -196,6 +255,36 @@ func TestCheckPredictions(t *testing.T) {
 	os.WriteFile(ok, []byte("file,label,score\na.jpg,1,0.9\n"), 0o644) //nolint:errcheck
 	if err := checkPredictions(ok); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFindPredictions(t *testing.T) {
+	write := func(dir string, names ...string) {
+		for _, n := range names {
+			os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644) //nolint:errcheck
+		}
+	}
+	cases := map[string]struct {
+		files []string
+		want  string // "" = error
+	}{
+		"standard name":            {[]string{"predictions.csv", "debug.csv"}, "predictions.csv"},
+		"tsv":                      {[]string{"predictions.tsv"}, "predictions.tsv"},
+		"the only table":           {[]string{"preds.csv", "log.txt"}, "preds.csv"},
+		"nothing":                  {[]string{"log.txt"}, ""},
+		"several tables, no names": {[]string{"a.csv", "b.csv"}, ""},
+	}
+	for name, c := range cases {
+		dir := t.TempDir()
+		write(dir, c.files...)
+		got, err := findPredictions(dir)
+		var ao *eval.AdaptorOutputError
+		switch {
+		case c.want == "" && !errors.As(err, &ao):
+			t.Errorf("%s: err = %v, want an adaptor output error", name, err)
+		case c.want != "" && (err != nil || filepath.Base(got) != c.want):
+			t.Errorf("%s: got %q, %v", name, got, err)
+		}
 	}
 }
 
