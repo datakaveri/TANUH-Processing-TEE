@@ -25,6 +25,14 @@
 //
 //	file,label
 //	Suspicious/02da7fc6.jpg,1        (file = path in the dataset folder)
+//
+// Segmentation (MatchMasks): the label column names each sample's mask file
+// in the dataset instead of a class, matched by the same rules. Masks are
+// resolved first and the sample ids only against the remaining files, so
+// images/a.jpg and masks/a.png never collide. The canonical form is then
+//
+//	file,mask
+//	images/a.jpg,/job/dataset/masks/a.png    (mask = the decrypted mask on disk)
 package groundtruth
 
 import (
@@ -72,12 +80,14 @@ type Row struct {
 
 // Result is the ground truth matched against a dataset.
 type Result struct {
-	Rows      []Row          // matched samples, sorted by File
-	Total     int            // entries in the file
-	Unlabeled int            // entries with an empty label, skipped
-	Unmatched []string       // ids with no file in the dataset, skipped
-	LabelMode string         // "index" or "name"
-	MatchedBy map[string]int // matching rule -> count
+	Rows      []Row             // matched samples, sorted by File
+	Total     int               // entries in the file
+	Unlabeled int               // entries with an empty label, skipped
+	Unmatched []string          // ids with no file in the dataset, skipped
+	LabelMode string            // "index", "name", "mask" (segmentation), "single" (one-class boxes)
+	MatchedBy map[string]int    // matching rule -> count
+	Masks     map[string]string // segmentation: row File -> its mask's path in the dataset
+	Boxes     map[string][]Box  // object detection: row File -> its boxes (none: no objects)
 }
 
 // ── reading ─────────────────────────────────────────────────────────────────
@@ -119,8 +129,9 @@ var (
 	idHints    = []string{"file", "path", "image", "img", "dicom", "case", "subject", "folder", "sample", "id", "name"}
 	labelNames = []string{"label", "labels", "class", "class_id", "class_label", "class_name", "category",
 		"category_id", "target", "y", "gt", "ground_truth", "groundtruth", "truth", "diagnosis",
-		"annotation", "grade", "outcome"}
-	labelHints = []string{"label", "class", "target", "category", "diagnos", "truth", "grade"}
+		"annotation", "grade", "outcome",
+		"mask", "mask_path", "mask_file", "mask_name", "segmentation", "seg", "seg_mask"} // segmentation
+	labelHints = []string{"label", "class", "target", "category", "diagnos", "truth", "grade", "mask"}
 )
 
 func normName(s string) string {
@@ -714,6 +725,111 @@ func Match(t *Table, classNames []string, files []string) (*Result, error) {
 	return res, nil
 }
 
+// MatchMasks is Match for segmentation: every entry's label names the
+// sample's mask file. Masks are matched against all files first; the sample
+// ids then only against the files that are not masks. A row whose sample or
+// mask has no file is skipped and counted, like an unmatched row in Match.
+func MatchMasks(t *Table, files []string) (*Result, error) {
+	res := &Result{Total: len(t.Entries), MatchedBy: map[string]int{}, LabelMode: "mask", Masks: map[string]string{}}
+	var labelled []Entry
+	for _, e := range t.Entries {
+		if e.Label == "" {
+			res.Unlabeled++
+			continue
+		}
+		if e.ID == "" {
+			return nil, fmt.Errorf("ground truth line %d: empty file id", e.Line)
+		}
+		labelled = append(labelled, e)
+	}
+	if len(labelled) == 0 {
+		return nil, errors.New("ground truth has no rows with a mask")
+	}
+
+	var ambiguous []string
+	note := func(err error) bool {
+		var amb *errAmbiguous
+		if errors.As(err, &amb) {
+			ambiguous = append(ambiguous, amb.Error())
+			return true
+		}
+		return false
+	}
+	all := newMatcher(files)
+	maskOf := make([]string, len(labelled))
+	isMask := map[string]bool{}
+	for i, e := range labelled {
+		f, _, err := all.match(e.Label)
+		if note(err) {
+			continue
+		}
+		maskOf[i] = f
+		if f != "" {
+			isMask[f] = true
+		}
+	}
+	var inputs []string
+	for _, f := range files {
+		if !isMask[f] {
+			inputs = append(inputs, f)
+		}
+	}
+	samples := newMatcher(inputs)
+
+	type hit struct {
+		mask, id string
+		line     int
+	}
+	byFile := map[string]hit{}
+	matched := 0
+	for i, e := range labelled {
+		if maskOf[i] == "" {
+			res.Unmatched = append(res.Unmatched, e.ID)
+			continue
+		}
+		f, rule, err := samples.match(e.ID)
+		if note(err) {
+			continue
+		}
+		if f == "" {
+			res.Unmatched = append(res.Unmatched, e.ID)
+			continue
+		}
+		matched++
+		if prev, dup := byFile[f]; dup {
+			if prev.mask != maskOf[i] {
+				return nil, fmt.Errorf("ground truth lines %d (%q) and %d (%q) give %s different masks",
+					prev.line, prev.id, e.Line, e.ID, f)
+			}
+			continue
+		}
+		byFile[f] = hit{mask: maskOf[i], id: e.ID, line: e.Line}
+		res.MatchedBy[rule]++
+	}
+	if len(ambiguous) > 0 {
+		if len(ambiguous) > 3 {
+			ambiguous = append(ambiguous[:3], "…")
+		}
+		return nil, fmt.Errorf("ground truth: some files or masks fit more than one dataset file, name them by "+
+			"their path in the dataset instead: %s", strings.Join(ambiguous, "; "))
+	}
+	if matched == 0 || float64(matched) < MinMatchedFraction*float64(len(labelled)) {
+		shown := res.Unmatched
+		if len(shown) > 3 {
+			shown = shown[:3]
+		}
+		return nil, fmt.Errorf("ground truth: only %d of %d rows match both a dataset file and its mask "+
+			"(unmatched e.g. %q); name files and masks by path, file name or name without extension",
+			matched, len(labelled), shown)
+	}
+	for f, h := range byFile {
+		res.Rows = append(res.Rows, Row{File: f})
+		res.Masks[f] = h.mask
+	}
+	sort.Slice(res.Rows, func(i, j int) bool { return res.Rows[i].File < res.Rows[j].File })
+	return res, nil
+}
+
 // ── output for the Python stages ────────────────────────────────────────────
 
 // WriteCanonical writes the matched rows as file,label for the evaluator.
@@ -723,6 +839,26 @@ func WriteCanonical(filePath string, rows []Row) error {
 	_ = w.Write([]string{"file", "label"})
 	for _, r := range rows {
 		_ = w.Write([]string{r.File, strconv.Itoa(r.Label)})
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		return err
+	}
+	return os.WriteFile(filePath, buf.Bytes(), 0o644)
+}
+
+// WriteCanonicalMasks writes segmentation rows as file,mask for the
+// evaluator; mask is the decrypted mask's path on disk.
+func WriteCanonicalMasks(filePath string, rows []Row, masks map[string]string, pathOf func(file string) string) error {
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	_ = w.Write([]string{"file", "mask"})
+	for _, r := range rows {
+		m := masks[r.File]
+		if m == "" {
+			return fmt.Errorf("ground truth row %s has no mask", r.File)
+		}
+		_ = w.Write([]string{r.File, pathOf(m)})
 	}
 	w.Flush()
 	if err := w.Error(); err != nil {

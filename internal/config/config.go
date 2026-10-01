@@ -55,7 +55,7 @@ func FromEnv() Config {
 
 		ProjectID:        getEnv("GCP_PROJECT_ID", "proj-tanuh-benchmark-ptfm"),
 		DatasetsBucket:   getEnv("DATASETS_BUCKET", "file-server-data"),
-		CatalogueBaseURL: getEnv("CATALOGUE_BASE_URL", "https://benchmark.tanuh.ai"),
+		CatalogueBaseURL: getEnv("CATALOGUE_BASE_URL", "https://bodh.tanuh.ai"),
 
 		StopProject:  getEnv("PROJECT", "p3dx-depa-sandbox"),
 		StopZone:     getEnv("ZONE", "us-central1-a"),
@@ -71,7 +71,7 @@ func FromEnv() Config {
 		EvaluatorTimeout: secondsEnv("PROCESSING_EVALUATOR_TIMEOUT_SECONDS", 600),
 		DepsTimeout:      secondsEnv("PROCESSING_DEPS_TIMEOUT_SECONDS", 600),
 		LeaderboardURL: getEnv("LEADERBOARD_SUBMIT_URL",
-			"https://benchmark.tanuh.ai/leaderboard/submit-solution"),
+			"https://bodh.tanuh.ai/leaderboard/submit-solution"),
 		PolicyPath:       getEnv("NETWORK_POLICY_PATH", base+"/policy/network_policy.json"),
 		AttestAudience:   "https://tanuh-processing-tee",
 		CallbackAudience: getEnv("CALLBACK_AUDIENCE", "tanuh-buffer-callback"),

@@ -1,12 +1,49 @@
 package catalogue
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 )
+
+// The controlplane answers 401 to an expired bearer even for an open item:
+// FetchSpec retries once without it, and still fails for a restricted item.
+func TestFetchSpecRetriesWithoutExpiredToken(t *testing.T) {
+	item := `{"result":[{"problemStatement":"binary_classification","class_names":["a","b"]}]}`
+	var withToken, without int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			withToken++
+			http.Error(w, `{"detail":"Invalid JWT token: token expired."}`, http.StatusUnauthorized)
+			return
+		}
+		without++
+		if r.URL.Query().Get("id") == "restricted" {
+			http.Error(w, `{"detail":"not authorized"}`, http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(item))
+	}))
+	defer srv.Close()
+
+	s, err := FetchSpec(context.Background(), srv.URL, "open", "expired-token")
+	if err != nil || s.TaskType != "binary_classification" || withToken != 1 || without != 1 {
+		t.Fatalf("open item: %v %+v (with %d, without %d)", err, s, withToken, without)
+	}
+	if _, err := FetchSpec(context.Background(), srv.URL, "restricted", "expired-token"); err == nil ||
+		!strings.Contains(err.Error(), "status 401") {
+		t.Fatalf("restricted item: %v", err)
+	}
+	withToken, without = 0, 0
+	if _, err := FetchSpec(context.Background(), srv.URL, "open", ""); err != nil || withToken != 0 || without != 1 {
+		t.Fatalf("no token: %v (with %d, without %d)", err, withToken, without)
+	}
+}
 
 func load(t *testing.T, name string) Spec {
 	t.Helper()
@@ -129,5 +166,12 @@ func TestParseItemAndValidate(t *testing.T) {
 	}
 	if _, err := ParseItem([]byte(`{"result":[]}`)); err == nil {
 		t.Fatal("empty result accepted")
+	}
+	// Detection has no background class: one class is enough; classification needs 2.
+	if err := (Spec{TaskType: "object_detection", ClassNames: []string{"kidney"}}).Validate(); err != nil {
+		t.Fatalf("single-class detection: %v", err)
+	}
+	if err := (Spec{TaskType: "binary_classification", ClassNames: []string{"x"}}).Validate(); err == nil {
+		t.Fatal("single-class classification accepted")
 	}
 }

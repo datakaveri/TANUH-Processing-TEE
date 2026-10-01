@@ -40,18 +40,18 @@
     },
 
     {
-      "destination": "benchmark.tanuh.ai",
+      "destination": "bodh.tanuh.ai",
       "protocol": "tcp",
       "ports": [443],
       "download": "ALLOW",
       "upload": "ALLOW",
-      "description": "Allow leaderboard result upload and catalogue (cat/item) declaration download"
+      "description": "Allow leaderboard result upload (/leaderboard) and catalogue (cat/item) declaration download (/controlplane)"
     },
 
     {
-      "destination": "tee.dev.tanuh.iudx.io",
+      "destination": "bodh.tanuh.ai/tee",
       "protocol": "tcp",
-      "ports": [8443],
+      "ports": [443],
       "download": "DENY",
       "upload": "ALLOW",
       "description": "Allow job completion callback to the Buffer TEE"

@@ -33,6 +33,25 @@ const (
 	maxResultsBytes     = 1 << 20
 )
 
+// gtKind is what a bucket's ground truth gives per sample.
+type gtKind string
+
+const (
+	gtClass gtKind = "class" // a class name or index (groundtruth.Match)
+	gtMask  gtKind = "mask"  // a mask file in the dataset (groundtruth.MatchMasks)
+	gtBox   gtKind = "box"   // zero or more boxes (groundtruth.MatchBoxes); inference runs per sample
+)
+
+// bucketKinds lists the buckets whose ground truth is not a class per sample.
+var bucketKinds = map[string]gtKind{"segmentation": gtMask, "object_detection": gtBox}
+
+func kindOf(bucket string) gtKind {
+	if k, ok := bucketKinds[bucket]; ok {
+		return k
+	}
+	return gtClass
+}
+
 // materialized holds everything RunJob needs after payload validation.
 type materialized struct {
 	jobID         string
@@ -149,19 +168,29 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 	//    data, so it is wiped when the job finishes either way.
 	datasetDir := filepath.Join(job.runtimeDir, "dataset")
 	defer os.RemoveAll(datasetDir)
+	kind := kindOf(spec.TaskType)
 	var ds *dataset
 	if err := timed("dataset", func() (err error) {
-		ds, err = m.fetchAndDecryptDataset(ctx, job.datasetUUID, datasetDir, spec.ClassNames)
+		ds, err = m.fetchAndDecryptDataset(ctx, job.datasetUUID, datasetDir, spec.ClassNames, kind)
 		return err
 	}); err != nil {
 		return err
 	}
 
-	// 5. The canonical ground truth (file = path in the dataset, label =
-	//    class index) for the evaluator, and the input list for inference.
+	// 5. The canonical ground truth for the evaluator (file = path in the
+	//    dataset, then the class index; for segmentation the decrypted mask;
+	//    for detection one row per box), and the input list for inference.
 	rows := ds.Match.Rows
 	groundTruthPath := filepath.Join(job.runtimeDir, "ground_truth.csv")
-	if err := groundtruth.WriteCanonical(groundTruthPath, rows); err != nil {
+	switch kind {
+	case gtMask:
+		err = groundtruth.WriteCanonicalMasks(groundTruthPath, rows, ds.Match.Masks, func(f string) string { return ds.Paths[f] })
+	case gtBox:
+		err = groundtruth.WriteCanonicalBoxes(groundTruthPath, rows, ds.Match.Boxes)
+	default:
+		err = groundtruth.WriteCanonical(groundTruthPath, rows)
+	}
+	if err != nil {
 		return err
 	}
 	inputsPath := filepath.Join(job.runtimeDir, "inputs.txt")
@@ -185,12 +214,16 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 	rawDir := filepath.Join(job.runtimeDir, "raw")
 	predDir := filepath.Join(job.runtimeDir, "predictions")
 	resultsPath := filepath.Join(job.runtimeDir, "results.json")
+	inferArgs := []string{"--format", job.modelFormat, "--model-dir", job.modelDir,
+		"--inputs", inputsPath, "--output-dir", rawDir}
+	if kind == gtBox {
+		inferArgs = append(inferArgs, "--per-sample") // detectors return a different number of boxes per image
+	}
 	if err := timed(eval.StageInfer, func() error {
 		return eval.RunStage(ctx, eval.Stage{
-			Name:   eval.StageInfer,
-			Script: filepath.Join(m.cfg.BaseDir, "infer.py"),
-			Args: []string{"--format", job.modelFormat, "--model-dir", job.modelDir,
-				"--inputs", inputsPath, "--output-dir", rawDir},
+			Name:    eval.StageInfer,
+			Script:  filepath.Join(m.cfg.BaseDir, "infer.py"),
+			Args:    inferArgs,
 			Dir:     job.runtimeDir,
 			Env:     []string{"HF_HUB_OFFLINE=1", "TRANSFORMERS_OFFLINE=1"},
 			Timeout: m.cfg.InferTimeout,
@@ -266,6 +299,7 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 		"unmatched":    len(ds.Match.Unmatched),
 		"unlabeled":    ds.Match.Unlabeled,
 		"matched_by":   ds.Match.MatchedBy,
+		"boxes":        ds.Match.BoxCount(),
 	}
 	results["modality"] = ds.Modality
 	results["leaderboard_metrics"] = lbMetrics

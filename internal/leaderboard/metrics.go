@@ -24,6 +24,17 @@ var metricAliases = map[string][]string{
 	"qwk":         {"qwk_quadratic_weight_kappa", "qwk_quadratic_weighted_kappa", "quadratic_weighted_kappa"},
 	"fnr":         {"fnr_false_negative_rate", "false_negative_rate"},
 	"fpr":         {"fpr_false_positive_rate", "false_positive_rate"},
+	// segmentation
+	"dice": {"dice_score", "dice_coefficient", "mean_dice"},
+	"iou":  {"iou_score", "jaccard", "jaccard_index", "mean_iou"},
+	// object detection (catalogue keys are slugs of names like "mAP@[0.5:0.95]" -> map_0_5_0_95).
+	// The detection evaluator reports mean_iou itself, and an identity match wins over the
+	// segmentation alias above.
+	"map":       {"map_0_5_0_95", "map_50_95", "map_0_50_0_95", "mean_average_precision", "coco_map"},
+	"ap50":      {"ap_0_5", "ap_50", "ap_0_50", "map_0_5", "map_50", "map50"},
+	"ap75":      {"ap_0_75", "ap_75", "map_0_75", "map_75", "map75"},
+	"map_giou":  {"giou_matched_map_0_5_0_95", "giou_map", "map_giou_0_5_0_95", "giou_matched_map"},
+	"recall_50": {"recall_0_5", "ar_0_5", "ar50", "ar_50"},
 }
 
 var aliasToStandard = func() map[string]string {

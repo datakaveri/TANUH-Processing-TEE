@@ -174,6 +174,25 @@ func TestForLeaderboardErrors(t *testing.T) {
 	}
 }
 
+// The kidney-detection legend's metric names, slugged as the UI stores them,
+// map onto the detection evaluator's names.
+func TestForLeaderboardDetectionKeys(t *testing.T) {
+	eval := map[string]any{"map": 0.41, "ap50": 0.72, "ap75": 0.39, "map_giou": 0.37, "recall_50": 0.8, "mean_iou": 0.66,
+		"per_class": map[string]any{}}
+	required := map[string]catalogue.MetricSpec{}
+	for _, k := range []string{"map_0_5_0_95", "giou_matched_map_0_5_0_95", "ap_0_5", "ap_0_75", "mean_iou"} {
+		required[k] = catalogue.MetricSpec{Name: k, Max: 1}
+	}
+	got, err := ForLeaderboard(eval, required)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"map_0_5_0_95": 0.41, "giou_matched_map_0_5_0_95": 0.37, "ap_0_5": 0.72, "ap_0_75": 0.39, "mean_iou": 0.66}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v", got)
+	}
+}
+
 func TestForLeaderboardWithoutRequirementsSendsFlatMetrics(t *testing.T) {
 	got, err := ForLeaderboard(evalMetrics(t, "multiclass_bcd"), nil)
 	if err != nil {

@@ -8,7 +8,7 @@ model provider's adaptor (stage 2) and the bucket evaluator (stage 3) do that.
 
     python3 infer.py --format onnx|torchscript|huggingface \
                      --model-dir DIR --inputs inputs.txt --output-dir raw/ \
-                     [--batch-size 8]
+                     [--batch-size 8] [--per-sample]
 
   --model-dir   ONNX:         model.onnx (+ model.onnx.data when the model has external weights)
                 TorchScript:  model.pt   (saved with torch.jit.save)
@@ -17,6 +17,16 @@ model provider's adaptor (stage 2) and the bucket evaluator (stage 3) do that.
   --inputs      one "<id>\t<path>" line per sample, in ground-truth order; <id> is
                 the sample's path in the dataset (a line without a tab: id = file name)
   --output-dir  receives raw_outputs.npz (`ids` + one array per model output) and meta.json
+  --per-sample  for models whose output size varies per input (object detection): run one
+                input at a time and keep each output exactly as the model returned it for
+                that input. raw_outputs.npz then holds, per output <name>:
+                  <name>          every input's output, flattened and concatenated
+                  <name>__shape   [N, ndim] the shape of input i's output (batch of one)
+                  <name>__offset  [N+1] input i's values are <name>[offset[i]:offset[i+1]]
+                plus orig_hw [N, 2] (each input's decoded height, width in pixels) and
+                input_hw [2] (the model's input height, width), so an adaptor can map
+                boxes from the model's input size back to the original image. The image
+                is resized to H x W without keeping its aspect ratio (no letterbox).
 
 Platform input contract (ONNX and TorchScript) — the platform turns every file
 into exactly the tensor the model declares, so no preprocessing script exists:
@@ -566,7 +576,7 @@ RUNTIMES = {"onnx": OnnxRuntime, "torchscript": TorchScriptRuntime, "huggingface
 
 def safe_output_names(names):
     """npz member names must be plain; keep a mapping back to the model's names."""
-    mapping, used = {}, {"ids"}
+    mapping, used = {}, {"ids", "orig_hw", "input_hw"}
     for n in names:
         s = re.sub(r"[^A-Za-z0-9_.-]", "_", n) or "output"
         base, i = s, 1
@@ -613,6 +623,55 @@ def run_inference(runtime, paths, batch_size):
         raise ModelError(f"model output shape changes between batches: {exc}") from exc
 
 
+def run_per_sample(runtime, paths):
+    """--per-sample: one input at a time. Returns ({output_name: (flat, shapes, offsets)},
+    orig_hw) where input i's output is flat[offsets[i]:offsets[i+1]].reshape(shapes[i])."""
+    fixed = runtime.spec.fixed_batch if runtime.spec else None
+    if fixed and fixed > 1:
+        # Padding a batch of one would make a padded output indistinguishable from K
+        # detections, so the model must accept a single input.
+        raise ModelError(f"per-sample inference needs a model with batch size 1 or a dynamic batch; "
+                         f"this one only accepts batches of {fixed}")
+    flats, shapes, names, orig_hw = {}, {}, None, []
+    for i, path in enumerate(paths):
+        img = decode(path)
+        orig_hw.append(img.shape[:2])
+        try:
+            if runtime.spec is None:
+                out = runtime.run([img])
+            else:
+                out = runtime.run(to_tensor(img, runtime.spec)[None])
+        except (ModelError, DecodeError):
+            raise
+        except Exception as exc:
+            if is_cuda_error(exc):
+                raise
+            raise ModelError(f"model failed on {Path(path).name}: {exc}") from exc
+        if names is None:
+            names = list(out)
+        elif list(out) != names:
+            raise ModelError(f"model outputs changed between inputs: {names} then {list(out)}")
+        for name, arr in out.items():
+            arr = np.asarray(arr)
+            if shapes.get(name) and len(shapes[name][0]) != arr.ndim:
+                raise ModelError(f"output {name!r} changes rank between inputs: "
+                                 f"{shapes[name][0]} then {arr.shape}")
+            flats.setdefault(name, []).append(arr.reshape(-1))
+            shapes.setdefault(name, []).append(arr.shape)
+        if i % 50 == 0:
+            log(f"  {i + 1}/{len(paths)} inputs done")
+    result = {}
+    for name in names or []:
+        counts = [f.size for f in flats[name]]
+        try:
+            flat = np.concatenate(flats[name])
+        except ValueError as exc:
+            raise ModelError(f"output {name!r} changes dtype between inputs: {exc}") from exc
+        result[name] = (flat, np.array(shapes[name], dtype=np.int64),
+                        np.concatenate([[0], np.cumsum(counts)]).astype(np.int64))
+    return result, np.array(orig_hw, dtype=np.int64)
+
+
 def read_inputs(path):
     """(ids, paths) from "<id>\\t<path>" lines; a line without a tab is a bare
     path whose id is its file name."""
@@ -636,6 +695,8 @@ def main():
     ap.add_argument("--inputs", required=True)
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
+    ap.add_argument("--per-sample", action="store_true",
+                    help="one input at a time; outputs may differ in size per input (detection)")
     args = ap.parse_args()
 
     started = time.perf_counter()
@@ -650,7 +711,10 @@ def main():
         log(f"runtime={runtime.name} {runtime.version} device={runtime.device} providers={runtime.providers}")
         if runtime.spec:
             log(f"input spec: {asdict(runtime.spec)} (from {runtime.spec_source})")
-        outputs = run_inference(runtime, paths, max(1, args.batch_size))
+        if args.per_sample:
+            ragged, orig_hw = run_per_sample(runtime, paths)
+        else:
+            outputs = run_inference(runtime, paths, max(1, args.batch_size))
     except DecodeError as exc:
         log(f"DATASET DECODE ERROR: {exc}")
         return EXIT_DECODE
@@ -663,10 +727,22 @@ def main():
             return EXIT_CUDA
         raise
 
-    names = safe_output_names(list(outputs))
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(out_dir / "raw_outputs.npz", ids=np.array(ids), **{names[k]: v for k, v in outputs.items()})
+    if args.per_sample:
+        names = safe_output_names(list(ragged))
+        arrays = {"ids": np.array(ids), "orig_hw": orig_hw}
+        if runtime.spec:
+            arrays["input_hw"] = np.array([runtime.spec.height, runtime.spec.width], dtype=np.int64)
+        for k, (flat, shapes, offsets) in ragged.items():
+            arrays[names[k]] = flat
+            arrays[names[k] + "__shape"] = shapes
+            arrays[names[k] + "__offset"] = offsets
+        np.savez(out_dir / "raw_outputs.npz", **arrays)
+        outputs = {k: flat for k, (flat, _, _) in ragged.items()}  # for meta.json and the log
+    else:
+        names = safe_output_names(list(outputs))
+        np.savez(out_dir / "raw_outputs.npz", ids=np.array(ids), **{names[k]: v for k, v in outputs.items()})
     meta = {
         "format": args.format,
         "runtime": runtime.name,
@@ -674,6 +750,7 @@ def main():
         "device": runtime.device,
         "providers": runtime.providers,
         "num_inputs": len(paths),
+        "per_sample": bool(args.per_sample),
         "input_spec": asdict(runtime.spec) if runtime.spec else None,
         "input_spec_source": runtime.spec_source,
         "outputs": {names[k]: {"model_name": k, "shape": list(v.shape)} for k, v in outputs.items()},

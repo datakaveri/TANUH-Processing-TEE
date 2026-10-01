@@ -186,8 +186,11 @@ func fileKind(head []byte, rel string) string {
 // matched files in parallel (each: KMS-unwrap its key, decrypt + verify
 // tanuh-enc-dataset-v1) into destDir at their paths in the dataset, keeping
 // each manifest next to its file. destDir is a per-job temp folder the caller
-// deletes when the job completes.
-func (m *Manager) fetchAndDecryptDataset(ctx context.Context, uuid, destDir string, classNames []string) (*dataset, error) {
+// deletes when the job completes. kind says what the ground truth holds per
+// sample: a class, a mask file (segmentation; the masks are decrypted too), or
+// boxes (object detection).
+func (m *Manager) fetchAndDecryptDataset(ctx context.Context, uuid, destDir string, classNames []string, kind gtKind) (*dataset, error) {
+	masks := kind == gtMask
 	bucket := m.cfg.DatasetsBucket
 	prefix := uuid + "/"
 	names, err := gcp.ListObjects(ctx, bucket, prefix)
@@ -207,17 +210,29 @@ func (m *Manager) fetchAndDecryptDataset(ctx context.Context, uuid, destDir stri
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: decrypt ground truth %s: %w", gtObj.Rel, err)
 	}
-	table, err := groundtruth.Read(gtObj.Rel, gtBytes)
-	if err != nil {
-		return nil, fmt.Errorf("pipeline: %w", err)
-	}
 	rels := make([]string, len(objects))
 	byRel := make(map[string]datasetObject, len(objects))
 	for i, o := range objects {
 		rels[i] = o.Rel
 		byRel[o.Rel] = o
 	}
-	match, err := groundtruth.Match(table, classNames, rels)
+	var (
+		table *groundtruth.Table
+		match *groundtruth.Result
+	)
+	if kind == gtBox {
+		var boxes *groundtruth.BoxTable
+		if boxes, err = groundtruth.ReadBoxes(gtObj.Rel, gtBytes); err == nil {
+			table = &groundtruth.Table{Format: boxes.Format, IDColumn: boxes.IDColumn, LabelColumn: boxes.LabelColumn}
+			match, err = groundtruth.MatchBoxes(boxes, classNames, rels)
+		}
+	} else if table, err = groundtruth.Read(gtObj.Rel, gtBytes); err == nil {
+		if masks {
+			match, err = groundtruth.MatchMasks(table, rels)
+		} else {
+			match, err = groundtruth.Match(table, classNames, rels)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: %w", err)
 	}
@@ -230,10 +245,18 @@ func (m *Manager) fetchAndDecryptDataset(ctx context.Context, uuid, destDir stri
 			len(match.Unmatched), shown)
 	}
 
-	// Only files the ground truth refers to are decrypted.
-	needed := make([]datasetObject, len(match.Rows))
-	for i, r := range match.Rows {
-		needed[i] = byRel[r.File]
+	// Only files the ground truth refers to are decrypted: the samples, and
+	// for segmentation their masks.
+	needed := make([]datasetObject, 0, len(match.Rows))
+	isMask := map[string]bool{}
+	for _, r := range match.Rows {
+		needed = append(needed, byRel[r.File])
+	}
+	for _, mask := range match.Masks {
+		if !isMask[mask] {
+			isMask[mask] = true
+			needed = append(needed, byRel[mask])
+		}
 	}
 	var mu sync.Mutex
 	kinds := map[string]int{}
@@ -241,6 +264,9 @@ func (m *Manager) fetchAndDecryptDataset(ctx context.Context, uuid, destDir stri
 		pt, err := m.decryptDatasetObject(ctx, bucket, obj, destDir)
 		if err != nil {
 			return fmt.Errorf("pipeline: decrypt %s: %w", obj.Cipher, err)
+		}
+		if isMask[obj.Rel] {
+			return nil // masks don't describe the model's input modality
 		}
 		kind := fileKind(pt[:min(len(pt), 132)], obj.Rel)
 		mu.Lock()
@@ -257,8 +283,15 @@ func (m *Manager) fetchAndDecryptDataset(ctx context.Context, uuid, destDir stri
 		ds.Paths[o.Rel] = filepath.Join(destDir, filepath.FromSlash(o.Rel))
 	}
 	ds.Modality = modalityOf(kinds)
-	log.Printf("pipeline: decrypted ground truth %s + %d of %d dataset files (%v) in %s", gtObj.Rel, len(needed),
-		len(objects), kinds, time.Since(started).Round(time.Millisecond))
+	maskNote := ""
+	switch kind {
+	case gtMask:
+		maskNote = fmt.Sprintf(" (%d samples + %d masks)", len(match.Rows), len(isMask))
+	case gtBox:
+		maskNote = fmt.Sprintf(" (%d images, %d boxes)", len(match.Rows), match.BoxCount())
+	}
+	log.Printf("pipeline: decrypted ground truth %s + %d of %d dataset files%s (%v) in %s", gtObj.Rel, len(needed),
+		len(objects), maskNote, kinds, time.Since(started).Round(time.Millisecond))
 	return ds, nil
 }
 

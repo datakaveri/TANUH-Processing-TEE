@@ -342,5 +342,66 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(proc.returncode, 13, proc.stdout + proc.stderr)
 
 
+def bright_pixels_onnx(path, batch="b"):
+    """A model whose output length depends on the image: the [K, 3] (batch, row, col)
+    coordinates of every pixel brighter than 0.5, like a detector's variable box count."""
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [batch, 3, 16, 16])
+    y = helper.make_tensor_value_info("hits", TensorProto.INT64, None)
+    nodes = [helper.make_node("ReduceMean", ["x", "axes"], ["grey"], keepdims=0),
+             helper.make_node("Greater", ["grey", "half"], ["mask"]),
+             helper.make_node("NonZero", ["mask"], ["nz"]),
+             helper.make_node("Transpose", ["nz"], ["hits"], perm=[1, 0])]
+    init = [helper.make_tensor("axes", TensorProto.INT64, [1], [1]),
+            helper.make_tensor("half", TensorProto.FLOAT, [], [0.5])]
+    model = helper.make_model(helper.make_graph(nodes, "g", [x], [y], init),
+                              opset_imports=[helper.make_opsetid("", 18)])
+    model.ir_version = 10
+    onnx.save(model, str(path))
+
+
+class PerSample(unittest.TestCase):
+    """--per-sample (object detection): ragged outputs, original sizes."""
+
+    def run_infer(self, sizes_and_squares, batch="b"):
+        import cv2
+        d = Path(tempfile.mkdtemp())
+        (d / "model").mkdir()
+        bright_pixels_onnx(d / "model" / "model.onnx", batch)
+        lines = []
+        for i, ((w, h), (x0, y0, x1, y1)) in enumerate(sizes_and_squares):
+            img = np.zeros((h, w, 3), dtype=np.uint8)
+            img[y0:y1, x0:x1] = 255
+            cv2.imwrite(str(d / f"img{i}.png"), img)
+            lines.append(f"scans/img{i}.png\t{d / f'img{i}.png'}")
+        (d / "inputs.txt").write_text("\n".join(lines))
+        proc = subprocess.run([sys.executable, str(INFER), "--format", "onnx", "--model-dir", str(d / "model"),
+                               "--inputs", str(d / "inputs.txt"), "--output-dir", str(d / "raw"), "--per-sample"],
+                              capture_output=True, text=True)
+        return proc, d
+
+    def test_ragged_outputs_and_original_sizes(self):
+        # 64x64 with a 16x16 square -> 4x4 = 16 bright model pixels; 32x48 with an 8x12 square -> 4x4;
+        # 64x64 with a 32x32 square -> 8x8 = 64
+        proc, d = self.run_infer([((64, 64), (16, 16, 32, 32)), ((32, 48), (8, 12, 16, 24)),
+                                  ((64, 64), (0, 0, 32, 32))])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        npz = np.load(d / "raw" / "raw_outputs.npz")
+        self.assertEqual([str(x) for x in npz["ids"]], ["scans/img0.png", "scans/img1.png", "scans/img2.png"])
+        np.testing.assert_array_equal(npz["orig_hw"], [[64, 64], [48, 32], [64, 64]])
+        np.testing.assert_array_equal(npz["input_hw"], [16, 16])
+        np.testing.assert_array_equal(npz["hits__shape"], [[16, 3], [16, 3], [64, 3]])
+        np.testing.assert_array_equal(npz["hits__offset"], [0, 48, 96, 288])
+        off, shp = npz["hits__offset"], npz["hits__shape"]
+        third = npz["hits"][off[2]:off[3]].reshape(shp[2])
+        self.assertEqual((third[:, 1].min(), third[:, 1].max(), third[:, 2].max()), (0, 7, 7))
+        meta = json.loads((d / "raw" / "meta.json").read_text())
+        self.assertTrue(meta["per_sample"])
+
+    def test_fixed_batch_above_one_refused(self):
+        proc, _ = self.run_infer([((16, 16), (0, 0, 8, 8))], batch=2)
+        self.assertEqual(proc.returncode, 13, proc.stdout + proc.stderr)
+        self.assertIn("batch size 1", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

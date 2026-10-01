@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -31,27 +32,41 @@ type Spec struct {
 // FetchSpec GETs {baseURL}/controlplane/iudx/v2/cat/item?id=<uuid>.
 // token is the bearer forwarded with the request.
 //
-// problemStatement is written by the UI's dataset metadata form; class_names
-// has no form field yet. datasetMetrics / primaryMetric already exist.
+// The token is the job submitter's Keycloak access token, which lives only a
+// few minutes and can expire while the Processing VM boots. The controlplane
+// then answers 401 even for an open item, so on a 401 the request is retried
+// once without the token: an open item is served, a restricted one stays 401.
 func FetchSpec(ctx context.Context, baseURL, uuid, token string) (Spec, error) {
+	status, raw, err := getItem(ctx, baseURL, uuid, token)
+	if err == nil && status == http.StatusUnauthorized && token != "" {
+		log.Printf("catalogue: item %s: 401 with the submitter's token (%s); retrying without it", uuid, snippet(raw))
+		status, raw, err = getItem(ctx, baseURL, uuid, "")
+	}
+	if err != nil {
+		return Spec{}, fmt.Errorf("catalogue: fetch item %s: %w", uuid, err)
+	}
+	if status != http.StatusOK {
+		return Spec{}, fmt.Errorf("catalogue: item %s status %d: %s", uuid, status, snippet(raw))
+	}
+	return ParseItem(raw)
+}
+
+func getItem(ctx context.Context, baseURL, uuid, token string) (int, []byte, error) {
 	u := fmt.Sprintf("%s/controlplane/iudx/v2/cat/item?id=%s&auditEnabled=false", baseURL, uuid)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return Spec{}, err
+		return 0, nil, err
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
-		return Spec{}, fmt.Errorf("catalogue: fetch item %s: %w", uuid, err)
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if resp.StatusCode != http.StatusOK {
-		return Spec{}, fmt.Errorf("catalogue: item %s status %d: %s", uuid, resp.StatusCode, snippet(raw))
-	}
-	return ParseItem(raw)
+	return resp.StatusCode, raw, nil
 }
 
 // ParseItem maps a cat/item response body to a Spec.
@@ -88,8 +103,12 @@ func (s Spec) Validate() error {
 	if s.TaskType == "" {
 		return fmt.Errorf("catalogue: the dataset has no problemStatement (problem bucket, e.g. binary_classification)")
 	}
-	if len(s.ClassNames) < 2 {
-		return fmt.Errorf("catalogue: the dataset needs at least 2 class_names, has %d", len(s.ClassNames))
+	min := 2 // classification and segmentation (background + 1)
+	if s.TaskType == "object_detection" {
+		min = 1 // no background class: a single object type is a valid detection task
+	}
+	if len(s.ClassNames) < min {
+		return fmt.Errorf("catalogue: the dataset needs at least %d class_names, has %d", min, len(s.ClassNames))
 	}
 	return nil
 }

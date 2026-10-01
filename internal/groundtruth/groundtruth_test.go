@@ -173,6 +173,60 @@ func TestMatchRejects(t *testing.T) {
 	}
 }
 
+func TestMatchMasks(t *testing.T) {
+	files := []string{"images/a.jpg", "images/b.jpg", "images/c.jpg", "masks/a.png", "masks/b.png", "masks/c.png"}
+	cases := map[string]string{
+		"paths":                        "image,mask\nimages/a.jpg,masks/a.png\nimages/b.jpg,masks/b.png\nimages/c.jpg,masks/c.png\n",
+		"file names":                   "image_path,mask_path\na.jpg,a.png\nb.jpg,b.png\nc.jpg,c.png\n",
+		"ids without extension":        "id,segmentation\na,a.png\nb,b.png\nc,c.png\n", // "a" alone fits only images/a.jpg
+		"json records":                 `[{"file": "a.jpg", "mask": "masks/a.png"}, {"file": "b.jpg", "mask": "masks/b.png"}, {"file": "c.jpg", "mask": "masks/c.png"}]`,
+		"no header, file + mask names": "a.jpg,a.png\nb.jpg,b.png\nc.jpg,c.png\n",
+	}
+	want := map[string]string{"images/a.jpg": "masks/a.png", "images/b.jpg": "masks/b.png", "images/c.jpg": "masks/c.png"}
+	for name, content := range cases {
+		file := "gt.csv"
+		if content[0] == '[' {
+			file = "gt.json"
+		}
+		tab, err := Read(file, []byte(content))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		res, err := MatchMasks(tab, files)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(res.Rows) != 3 || !reflect.DeepEqual(res.Masks, want) || res.LabelMode != "mask" {
+			t.Fatalf("%s: rows %v masks %v", name, res.Rows, res.Masks)
+		}
+	}
+
+	// Rows whose mask or image is missing are skipped and counted.
+	tab, _ := Read("gt.csv", []byte("file,mask\na.jpg,a.png\nb.jpg,b.png\nc.jpg,gone.png\ngone.jpg,c.png\n"))
+	res, err := MatchMasks(tab, files)
+	if err != nil || len(res.Rows) != 2 || len(res.Unmatched) != 2 {
+		t.Fatalf("partial: %v %+v", err, res)
+	}
+
+	// A mask named without an extension fits both a.jpg and a.png: an error, not a guess.
+	tab, _ = Read("gt.csv", []byte("file,mask\nimages/a.jpg,a\nimages/b.jpg,b.png\n"))
+	if _, err := MatchMasks(tab, files); err == nil {
+		t.Fatal("ambiguous mask accepted")
+	}
+
+	// Too few rows match both: refused.
+	tab, _ = Read("gt.csv", []byte("file,mask\na.jpg,x.png\nb.jpg,y.png\nc.jpg,c.png\n"))
+	if _, err := MatchMasks(tab, files); err == nil {
+		t.Fatal("1 of 3 matched accepted")
+	}
+
+	// The same image given two different masks is refused.
+	tab, _ = Read("gt.csv", []byte("file,mask\na.jpg,a.png\nimages/a.jpg,b.png\n"))
+	if _, err := MatchMasks(tab, files); err == nil {
+		t.Fatal("conflicting masks accepted")
+	}
+}
+
 func TestWriters(t *testing.T) {
 	dir := t.TempDir()
 	rows := []Row{{"Suspicious/a, b.jpg", 1}, {"c.jpg", 0}}
@@ -192,5 +246,19 @@ func TestWriters(t *testing.T) {
 	}
 	if err := WriteInputs(filepath.Join(dir, "bad.txt"), []Row{{"a\tb.jpg", 0}}, func(f string) string { return f }); err == nil {
 		t.Fatal("tab in a file name accepted")
+	}
+
+	masks := map[string]string{"img/a.jpg": "masks/a.png"}
+	if err := WriteCanonicalMasks(filepath.Join(dir, "seg.csv"), []Row{{File: "img/a.jpg"}}, masks,
+		func(f string) string { return "/d/" + f }); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(filepath.Join(dir, "seg.csv"))
+	if string(raw) != "file,mask\nimg/a.jpg,/d/masks/a.png\n" {
+		t.Fatalf("canonical masks %q", raw)
+	}
+	if err := WriteCanonicalMasks(filepath.Join(dir, "seg2.csv"), []Row{{File: "b.jpg"}}, masks,
+		func(f string) string { return f }); err == nil {
+		t.Fatal("row without a mask accepted")
 	}
 }
