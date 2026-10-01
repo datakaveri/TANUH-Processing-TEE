@@ -24,7 +24,7 @@ onnx==1.23.0
 # compatible with the CUDA 12.3 runtime base image.
 torch==2.5.1
 torchvision==0.20.1
-transformers==4.46.3
+transformers==5.10.1
 safetensors==0.8.0
 # Decoders: DICOM (incl. JPEG-Lossless mammograms) and images.
 pydicom==3.0.2
