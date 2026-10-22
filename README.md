@@ -8,12 +8,14 @@ The runtime is a **single Go binary** (`processing-tee`). Python runs three stag
 
 ```
 Buffer TEE
-  │  secure job payload v2 over RA-TLS  (POST /api/load-model, :443)
+  │  payload v3 over RA-TLS  (POST /api/load-model, :443; multipart stream:
+  │  metadata + each artifact's encrypted upload, exactly as the browser sent it)
   ▼
 processing-tee (Go, single process)
   ├─ startup: network-policy attestation (policy hash bound into eat_nonce)
   ├─ RA-TLS server  (/ratls/connect: OIDC token, EKM channel binding)
-  ├─ payload v2 materialisation  (SHA-256 fail-closed; model laid out by format)
+  ├─ payload v3 intake  (artifacts decrypted chunk by chunk to disk, SHA-256 fail-closed)
+  ├─ materialisation  (model laid out by format)
   ├─ catalogue entry (cat/item)  → problem bucket, class_names, required metrics
   ├─ evaluator fetch  gs://tanuh-evaluators/<bucket>/evaluate.py  (sha256 + generation recorded)
   ├─ adaptor dependency install  (dep_scanner.py + uv)
@@ -24,18 +26,30 @@ processing-tee (Go, single process)
   └─ self-deallocation  (Compute API stop; after job + idle timeout)
 ```
 
-There is no Flask layer, no localhost hop, and no app-layer payload
-encryption: confidentiality in transit is the RA-TLS channel; integrity is
-the browser's SHA-256 commitment, re-verified by the buffer and again here.
+There is no Flask layer and no localhost hop. Model uploads stay encrypted
+with the browser's per-file AES keys until they are decrypted here; the keys
+reach this TEE inside the RA-TLS channel. Integrity is the browser's SHA-256
+commitment, checked here at intake (the buffer only checks that each upload
+arrived whole). Memory stays at a few chunks whatever the model's size.
 
 ## Job stages
 
 A model can be **ONNX** (`model.onnx` + optional `model.onnx.data`),
-**TorchScript** (`model.pt` carrying `extra/tanuh.json`) or **Hugging Face**
-(a zip of a `save_pretrained()` folder with safetensors weights). The platform
-prepares every input to the model's declared shape, so there is no
-preprocessing script; model-specific normalisation lives inside the model.
-`tools/check_model.py` runs the same checks locally.
+**TorchScript** (`model.pt` from `torch.jit.save`) or **Hugging Face** (a zip
+holding a `save_pretrained()` folder with safetensors weights; only the files
+transformers needs are extracted). An optional uploaded `input_spec.json`
+gives the input size / resize (required for TorchScript unless embedded in
+the `.pt`). The platform prepares every input to the model's declared shape,
+so there is no preprocessing script; model-specific normalisation lives
+inside the model. `tools/check_model.py` runs the same checks locally.
+
+The dataset folder may nest its files in subfolders at any depth; the ground
+truth (CSV/TSV/JSON/JSON Lines, flexible column names, class indexes or names)
+sits in the folder itself. The TEE decrypts it first, matches its rows to
+files (path, file name, name without extension, or a per-sample folder), then
+decrypts only the matched files, and hands the stages a canonical
+`ground_truth.csv` (`file` = path in the dataset) and `inputs.txt`. The
+evaluators read `predictions.csv` leniently (see docs/model-submission.md).
 
 ```
 python3 /app/infer.py --format F --model-dir M --inputs inputs.txt --output-dir raw/
@@ -64,14 +78,14 @@ satisfy the dataset's catalogue definitions is submitted as failed
 |---|---|
 | `cmd/processing-tee/` | main: policy attestation → RA-TLS server → serve |
 | `internal/ratls/` | RA-TLS server, EKM nonce (dependency-free audit surface) |
-| `internal/pipeline/` | job lifecycle: materialise → catalogue → evaluator → dataset → stages → report → dealloc |
+| `internal/pipeline/` | job lifecycle: v3 intake → materialise → catalogue → evaluator → dataset → stages → report → dealloc |
 | `internal/catalogue/` | catalogue entry: bucket, class_names, required leaderboard metrics |
 | `internal/evaluator/` | fetch a bucket's evaluate.py (GCS now, image later) |
 | `internal/modelpkg/` | lay out + validate a model by format (ONNX / TorchScript / Hugging Face) |
-| `internal/groundtruth/` | parse ground_truth.csv, match it to the data files |
+| `internal/groundtruth/` | read the ground truth (CSV/TSV/JSON), match its rows to the dataset's files |
 | `internal/eval/` | Python stage runner + adaptor dependency install |
 | `internal/gcp/` | stdlib REST: metadata tokens, GCS, KMS, Secret Manager, Compute stop |
-| `internal/crypto/` | dataset AES-256-GCM formats (tanuh-enc-dataset-v1 + legacy) |
+| `internal/crypto/` | dataset decryption (tanuh-enc-dataset-v1) and streaming upload decryption (AES-256-GCM-CHUNKED-v1) |
 | `internal/leaderboard/` | catalogue-keyed metrics, uuid5 job ids, error classification, submit |
 | `internal/attest/` | CS launcher token fetch + claims decode |
 | `internal/policy/` | startup network-policy attestation (Python-compatible hash) |
