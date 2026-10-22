@@ -3,7 +3,6 @@ package pipeline
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"os"
@@ -17,33 +16,44 @@ import (
 	"github.com/datakaveri/tanuh-processing-tee/internal/modelpkg"
 )
 
-func artifact(data []byte) map[string]any {
-	sum := sha256.Sum256(data)
-	return map[string]any{"sha256": hex.EncodeToString(sum[:]), "base64": base64.StdEncoding.EncodeToString(data)}
-}
-
-func v2Payload(format string, artifacts map[string]any) map[string]any {
-	return map[string]any{
-		"payload_version": float64(2), // numbers decode as float64 from JSON
-		"job_id":          "job-abc123",
-		"dataset_id":      "d8c50b6b-af58-4f9d-9af8-4d42bfb1c4bb",
-		"model_format":    format,
-		"artifacts":       artifacts,
-	}
-}
-
 func testManager(t *testing.T) *Manager {
 	return &Manager{cfg: config.Config{BaseDir: t.TempDir()}}
 }
 
 var onnxModel = []byte{0x08, 0x0a, 0x12, 0x07}
 
+// testRequest writes each upload into the job's received/ folder, as intake
+// leaves them, and returns the request for them.
+func testRequest(t *testing.T, m *Manager, format string, uploads map[string][]byte) *Request {
+	t.Helper()
+	req := &Request{
+		JobID:         "job-abc123",
+		DatasetID:     "d8c50b6b-af58-4f9d-9af8-4d42bfb1c4bb",
+		ModelFormat:   format,
+		KeycloakToken: "secret-token",
+		Artifacts:     map[string]Artifact{},
+	}
+	dir := m.receivedDir(req.JobID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for slot, data := range uploads {
+		p := filepath.Join(dir, slot)
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(data)
+		req.Artifacts[slot] = Artifact{Path: p, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))}
+	}
+	return req
+}
+
 func TestMaterializeONNX(t *testing.T) {
 	m := testManager(t)
-	job, err := m.materialize(v2Payload("onnx", map[string]any{
-		"model":   artifact(onnxModel),
-		"weights": artifact([]byte("weights")),
-		"adaptor": artifact([]byte("print('adapt')")),
+	job, err := m.materialize(testRequest(t, m, "onnx", map[string][]byte{
+		"model":   onnxModel,
+		"weights": []byte("weights"),
+		"adaptor": []byte("print('ADAPTOR-SOURCE')"),
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -56,35 +66,49 @@ func TestMaterializeONNX(t *testing.T) {
 	if job.modelFormat != "onnx" || len(job.modelSHA256) != 64 || len(job.adaptorSHA256) != 64 {
 		t.Fatalf("job = %+v", job)
 	}
+	if _, err := os.Stat(m.receivedDir(job.jobID)); !os.IsNotExist(err) {
+		t.Errorf("received/ not cleaned up: %v", err)
+	}
+	receipt, err := os.ReadFile(filepath.Join(job.jobDir, "incoming_payload.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(receipt), "secret-token") || strings.Contains(string(receipt), "ADAPTOR-SOURCE") {
+		t.Errorf("receipt holds the token or file contents: %s", receipt)
+	}
 }
 
 func TestMaterializeRejects(t *testing.T) {
-	good := func() map[string]any {
-		return map[string]any{"model": artifact(onnxModel), "adaptor": artifact([]byte("a"))}
+	good := func() map[string][]byte {
+		return map[string][]byte{"model": onnxModel, "adaptor": []byte("a")}
 	}
-	tampered := good()
-	tampered["model"].(map[string]any)["sha256"] = strings.Repeat("0", 64)
-	noHash := good()
-	delete(noHash["adaptor"].(map[string]any), "sha256")
 	noAdaptor := good()
 	delete(noAdaptor, "adaptor")
 
-	cases := map[string]map[string]any{
-		"old payload (v1)":          {"payload_version": nil, "job_id": "j", "dataset_id": "d", "model_onnx_base64": "x"},
-		"missing adaptor":           v2Payload("onnx", noAdaptor),
-		"tampered model":            v2Payload("onnx", tampered),
-		"adaptor without hash":      v2Payload("onnx", noHash),
-		"unknown format":            v2Payload("keras", good()),
-		"path in job_id":            func() map[string]any { p := v2Payload("onnx", good()); p["job_id"] = "../evil"; return p }(),
-		"onnx bytes as torchscript": v2Payload("torchscript", good()),
+	cases := map[string]func(m *Manager) *Request{
+		"missing adaptor": func(m *Manager) *Request { return testRequest(t, m, "onnx", noAdaptor) },
+		"unknown format":  func(m *Manager) *Request { return testRequest(t, m, "keras", good()) },
+		"empty dataset_id": func(m *Manager) *Request {
+			r := testRequest(t, m, "onnx", good())
+			r.DatasetID = ""
+			return r
+		},
+		"path in job_id": func(m *Manager) *Request {
+			r := testRequest(t, m, "onnx", good())
+			r.JobID = "../evil"
+			return r
+		},
+		"onnx bytes as torchscript": func(m *Manager) *Request { return testRequest(t, m, "torchscript", good()) },
 	}
-	for name, payload := range cases {
-		if _, err := testManager(t).materialize(payload); err == nil {
+	for name, build := range cases {
+		m := testManager(t)
+		if _, err := m.materialize(build(m)); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
 	var fe *modelpkg.FormatError
-	if _, err := testManager(t).materialize(v2Payload("torchscript", good())); !errors.As(err, &fe) {
+	m := testManager(t)
+	if _, err := m.materialize(testRequest(t, m, "torchscript", good())); !errors.As(err, &fe) {
 		t.Errorf("format mismatch err = %v, want a model-format error", err)
 	}
 }

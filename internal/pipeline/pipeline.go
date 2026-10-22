@@ -2,9 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,10 +19,6 @@ import (
 	"github.com/datakaveri/tanuh-processing-tee/internal/leaderboard"
 	"github.com/datakaveri/tanuh-processing-tee/internal/modelpkg"
 )
-
-// payloadVersion is the Buffer → Processing TEE payload layout this build
-// understands (Buffer: scheduler.PayloadVersion). Both ship together.
-const payloadVersion = 2
 
 // Size caps for files the Python stages hand back.
 const (
@@ -70,13 +63,13 @@ type materialized struct {
 	bufferJobURL    string
 }
 
-// RunJob executes the full secure-job pipeline for an accepted payload and
+// RunJob executes the full secure-job pipeline for an accepted request and
 // always releases the job slot. Meant to run on its own goroutine.
-func (m *Manager) RunJob(ctx context.Context, payload map[string]any) {
-	jobID := stringField(payload, "job_id")
+func (m *Manager) RunJob(ctx context.Context, req *Request) {
+	jobID := req.JobID
 	defer m.releaseJobSlot()
 
-	job, err := m.materialize(payload)
+	job, err := m.materialize(req)
 	if err == nil {
 		err = m.runSteps(ctx, job)
 	}
@@ -99,13 +92,13 @@ func (m *Manager) RunJob(ctx context.Context, payload map[string]any) {
 	claims := attest.FetchClaims(ctx, m.cfg.AttestAudience)
 	leaderboard.Submit(ctx, m.cfg.LeaderboardURL, leaderboard.Submission{
 		JobID:         jobID,
-		DatasetID:     stringField(payload, "dataset_id"),
+		DatasetID:     req.DatasetID,
 		Claims:        claims,
 		Succeeded:     false,
 		Error:         &errInfo,
-		KeycloakToken: stringField(payload, "keycloak_token"),
+		KeycloakToken: req.KeycloakToken,
 	})
-	m.notifyBuffer(ctx, stringField(payload, "buffer_job_url"), jobID, "failed", &errInfo)
+	m.notifyBuffer(ctx, req.BufferJobURL, jobID, "failed", &errInfo)
 
 	if m.cfg.DeallocAfterJob {
 		m.RequestDeallocation(ctx, fmt.Sprintf("job %s failed", jobID))
@@ -338,28 +331,19 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 	return nil
 }
 
-// materialize validates a version-2 payload and lays the artifacts out:
-//
-//	{"payload_version": 2, "job_id", "dataset_id", "model_format",
-//	 "keycloak_token", "buffer_job_url",
-//	 "artifacts": {"model"|"weights"|"adaptor"|"input_spec": {"sha256", "base64"}}}
-//
-// Every artifact must carry a SHA-256 (committed by the browser at submit and
-// re-checked by the Buffer) that matches its bytes. Confidentiality in transit
-// is the RA-TLS channel.
-func (m *Manager) materialize(payload map[string]any) (*materialized, error) {
-	if v, _ := payload["payload_version"].(float64); int(v) != payloadVersion {
-		return nil, fmt.Errorf("pipeline: unsupported payload_version %v (this Processing TEE needs %d; "+
-			"deploy the matching Buffer TEE)", payload["payload_version"], payloadVersion)
-	}
+// materialize validates a request and lays its artifacts out for the stages.
+// The artifacts are already on disk, decrypted at intake and checked against
+// the SHA-256 the browser committed to at submit; this only moves them into
+// place, so a model in the wrong format is reported as a failed job.
+func (m *Manager) materialize(req *Request) (*materialized, error) {
 	job := &materialized{
-		jobID:         stringField(payload, "job_id"),
-		datasetUUID:   stringField(payload, "dataset_id"),
-		modelFormat:   stringField(payload, "model_format"),
-		keycloakToken: stringField(payload, "keycloak_token"),
-		bufferJobURL:  stringField(payload, "buffer_job_url"),
+		jobID:         req.JobID,
+		datasetUUID:   req.DatasetID,
+		modelFormat:   req.ModelFormat,
+		keycloakToken: req.KeycloakToken,
+		bufferJobURL:  req.BufferJobURL,
 	}
-	if job.jobID == "" || job.jobID != filepath.Base(job.jobID) {
+	if !validJobID(job.jobID) {
 		return nil, fmt.Errorf("pipeline: invalid job_id")
 	}
 	if job.datasetUUID == "" {
@@ -371,27 +355,18 @@ func (m *Manager) materialize(payload map[string]any) (*materialized, error) {
 		return nil, &modelpkg.FormatError{Msg: fmt.Sprintf("unsupported model_format %q", job.modelFormat)}
 	}
 
-	artifacts, _ := payload["artifacts"].(map[string]any)
-	model, modelSHA, err := decodeArtifact(artifacts, "model", true)
-	if err != nil {
-		return nil, err
-	}
-	weights, weightsSHA, err := decodeArtifact(artifacts, "weights", false)
-	if err != nil {
-		return nil, err
-	}
-	adaptor, adaptorSHA, err := decodeArtifact(artifacts, "adaptor", true)
-	if err != nil {
-		return nil, err
-	}
-	inputSpec, inputSpecSHA, err := decodeArtifact(artifacts, "input_spec", false)
-	if err != nil {
-		return nil, err
-	}
-	job.modelSHA256, job.weightsSHA256, job.adaptorSHA256 = modelSHA, weightsSHA, adaptorSHA
-	job.inputSpecSHA256 = inputSpecSHA
-
 	job.jobDir = m.jobDir(job.jobID)
+	defer os.RemoveAll(m.receivedDir(job.jobID)) // whatever placement did not move (e.g. a Hugging Face zip)
+	for _, slot := range uploadSlots {
+		if _, ok := req.Artifacts[slot.Name]; slot.Required && !ok {
+			return nil, fmt.Errorf("pipeline: payload has no %s artifact", slot.Name)
+		}
+	}
+	job.modelSHA256 = req.Artifacts["model"].SHA256
+	job.weightsSHA256 = req.Artifacts["weights"].SHA256
+	job.adaptorSHA256 = req.Artifacts["adaptor"].SHA256
+	job.inputSpecSHA256 = req.Artifacts["input_spec"].SHA256
+
 	job.runtimeDir = filepath.Join(job.jobDir, "runtime")
 	job.modelDir = filepath.Join(job.jobDir, "artifacts", "model")
 	scriptsDir := filepath.Join(job.jobDir, "artifacts", "scripts")
@@ -400,53 +375,23 @@ func (m *Manager) materialize(payload map[string]any) (*materialized, error) {
 			return nil, err
 		}
 	}
-	if err := modelpkg.Place(job.modelFormat, model, weights, inputSpec, job.modelDir); err != nil {
+	// The receipt is written before placement so a model-format failure
+	// still leaves a record of what arrived.
+	if err := writeJSON(filepath.Join(job.jobDir, "incoming_payload.json"), req.receipt()); err != nil {
+		log.Printf("pipeline: write incoming_payload.json: %v", err)
+	}
+	if err := modelpkg.Place(job.modelFormat, req.path("model"), req.path("weights"), req.path("input_spec"), job.modelDir); err != nil {
 		return nil, err
 	}
 	job.adaptorPath = filepath.Join(scriptsDir, "adaptor.py")
-	if err := os.WriteFile(job.adaptorPath, adaptor, 0o644); err != nil {
+	if err := os.Rename(req.path("adaptor"), job.adaptorPath); err != nil {
 		return nil, err
 	}
 
-	if raw, err := json.MarshalIndent(payload, "", "  "); err == nil {
-		if err := os.WriteFile(filepath.Join(job.jobDir, "incoming_payload.json"), raw, 0o644); err != nil {
-			log.Printf("pipeline: write incoming_payload.json: %v", err)
-		}
-	}
 	log.Printf("pipeline: secure job %s materialized (%s model %d bytes, weights %d bytes, adaptor %d bytes)",
-		job.jobID, job.modelFormat, len(model), len(weights), len(adaptor))
+		job.jobID, job.modelFormat, req.Artifacts["model"].Size,
+		req.Artifacts["weights"].Size, req.Artifacts["adaptor"].Size)
 	return job, nil
-}
-
-func stringField(payload map[string]any, key string) string {
-	s, _ := payload[key].(string)
-	return s
-}
-
-// decodeArtifact base64-decodes artifacts[slot] and checks it against its
-// SHA-256 (fail closed: a present artifact without a valid hash is rejected).
-// A missing optional artifact returns nil bytes.
-func decodeArtifact(artifacts map[string]any, slot string, required bool) ([]byte, string, error) {
-	entry, ok := artifacts[slot].(map[string]any)
-	if !ok {
-		if required {
-			return nil, "", fmt.Errorf("pipeline: payload has no %s artifact", slot)
-		}
-		return nil, "", nil
-	}
-	data, err := base64.StdEncoding.DecodeString(stringField(entry, "base64"))
-	if err != nil {
-		return nil, "", fmt.Errorf("pipeline: %s artifact is not valid base64: %w", slot, err)
-	}
-	expected := strings.ToLower(strings.TrimSpace(stringField(entry, "sha256")))
-	if len(expected) != 64 {
-		return nil, "", fmt.Errorf("pipeline: %s artifact has no valid SHA-256", slot)
-	}
-	sum := sha256.Sum256(data)
-	if hex.EncodeToString(sum[:]) != expected {
-		return nil, "", fmt.Errorf("pipeline: %s artifact SHA256 mismatch in secure payload", slot)
-	}
-	return data, expected, nil
 }
 
 // findPredictions returns the adaptor's output table: predictions.csv (or

@@ -24,6 +24,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // Formats.
@@ -58,20 +59,32 @@ func (e *FormatError) Error() string { return "model format: " + e.Msg }
 
 func formatErr(format string, a ...any) error { return &FormatError{Msg: fmt.Sprintf(format, a...)} }
 
-// Place writes the model into dir for its format. weights is only valid for
-// ONNX; inputSpec (an optional input_spec.json) for ONNX and TorchScript.
-func Place(format string, model, weights, inputSpec []byte, dir string) error {
-	if len(model) == 0 {
+// Place lays the model out in dir for its format from files already on disk
+// (the decrypted uploads), never holding a whole file in memory: the model is
+// moved into dir (ONNX, TorchScript) or extracted from (Hugging Face).
+// weightsPath is only valid for ONNX; inputSpecPath (an optional
+// input_spec.json) for ONNX and TorchScript. An empty path means the file was
+// not uploaded.
+func Place(format, modelPath, weightsPath, inputSpecPath, dir string) error {
+	info, err := os.Stat(modelPath)
+	if err != nil {
+		return err
+	}
+	if info.Size() == 0 {
 		return formatErr("model file is empty")
 	}
-	if weights != nil && format != ONNX {
+	if weightsPath != "" && format != ONNX {
 		return formatErr("a weights file is only used with ONNX models")
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	if inputSpec != nil {
-		if err := placeInputSpec(format, inputSpec, dir); err != nil {
+	if inputSpecPath != "" {
+		spec, err := readAtMost(inputSpecPath, maxInputSpecBytes+1)
+		if err != nil {
+			return err
+		}
+		if err := placeInputSpec(format, spec, dir); err != nil {
 			return err
 		}
 	}
@@ -79,26 +92,85 @@ func Place(format string, model, weights, inputSpec []byte, dir string) error {
 	case ONNX:
 		// An ONNX file is a protobuf ModelProto; exporters write field 1
 		// (ir_version, a varint) first, i.e. the tag byte 0x08.
-		if model[0] != 0x08 {
-			return formatErr("model is not an ONNX file")
-		}
-		if err := os.WriteFile(filepath.Join(dir, "model.onnx"), model, 0o644); err != nil {
+		head, err := readAtMost(modelPath, 1)
+		if err != nil {
 			return err
 		}
-		if weights != nil {
-			return os.WriteFile(filepath.Join(dir, "model.onnx.data"), weights, 0o644)
+		if head[0] != 0x08 {
+			return formatErr("model is not an ONNX file")
+		}
+		if err := moveFile(modelPath, filepath.Join(dir, "model.onnx")); err != nil {
+			return err
+		}
+		if weightsPath != "" {
+			return moveFile(weightsPath, filepath.Join(dir, "model.onnx.data"))
 		}
 		return nil
 	case TorchScript:
-		if err := checkTorchScript(model, inputSpec != nil); err != nil {
+		if err := checkTorchScript(modelPath, inputSpecPath != ""); err != nil {
 			return err
 		}
-		return os.WriteFile(filepath.Join(dir, "model.pt"), model, 0o644)
+		return moveFile(modelPath, filepath.Join(dir, "model.pt"))
 	case HuggingFace:
-		return extractHuggingFace(model, filepath.Join(dir, hfFolder))
+		return extractHuggingFace(modelPath, filepath.Join(dir, hfFolder))
 	default:
 		return formatErr("unsupported model format %q", format)
 	}
+}
+
+// readAtMost returns up to n bytes from the start of a file.
+func readAtMost(path string, n int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, n))
+}
+
+// openZip opens a zip archive on disk; zip reads only its directory and the
+// entries asked for, so a multi-GB archive is never loaded whole.
+func openZip(path string) (*zip.Reader, *os.File, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	zr, err := zip.NewReader(f, info.Size())
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	return zr, f, nil
+}
+
+// moveFile renames src to dst, copying when they are on different filesystems.
+func moveFile(src, dst string) error {
+	err := os.Rename(src, dst)
+	if !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Remove(src)
 }
 
 // placeInputSpec writes an uploaded input_spec.json next to the model after
@@ -120,11 +192,12 @@ func placeInputSpec(format string, spec []byte, dir string) error {
 
 // checkTorchScript confirms a torch.jit.save archive. TorchScript records no
 // input size, so it must be embedded in the archive or uploaded alongside.
-func checkTorchScript(model []byte, specUploaded bool) error {
-	zr, err := zip.NewReader(bytes.NewReader(model), int64(len(model)))
+func checkTorchScript(modelPath string, specUploaded bool) error {
+	zr, f, err := openZip(modelPath)
 	if err != nil {
 		return formatErr("model is not a TorchScript archive (save it with torch.jit.save)")
 	}
+	defer f.Close()
 	var code, constants, spec bool
 	for _, f := range zr.File {
 		code = code || strings.Contains(f.Name, "/code/")
@@ -164,11 +237,12 @@ func hfNeeded(base string) bool {
 // extractHuggingFace finds the save_pretrained() folder in a zip (the
 // shallowest folder holding config.json — at the root, inside one wrapper
 // folder, or deeper) and extracts only the files transformers needs from it.
-func extractHuggingFace(data []byte, dest string) error {
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+func extractHuggingFace(zipPath, dest string) error {
+	zr, f, err := openZip(zipPath)
 	if err != nil {
 		return formatErr("Hugging Face model must be a .zip of a save_pretrained() folder")
 	}
+	defer f.Close()
 	if len(zr.File) > maxZipEntries {
 		return formatErr("Hugging Face zip has more than %d entries", maxZipEntries)
 	}

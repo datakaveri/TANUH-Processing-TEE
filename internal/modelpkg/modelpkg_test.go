@@ -39,6 +39,47 @@ func makeZip(t *testing.T, entries ...entry) []byte {
 	return buf.Bytes()
 }
 
+// place writes the given uploads to files (nil = not uploaded) and calls Place
+// on them, as the pipeline does with the decrypted uploads.
+func place(t *testing.T, format string, model, weights, inputSpec []byte, dir string) error {
+	t.Helper()
+	src := t.TempDir()
+	file := func(name string, data []byte) string {
+		if data == nil {
+			return ""
+		}
+		p := filepath.Join(src, name)
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	return Place(format, file("model", model), file("weights", weights), file("input_spec", inputSpec), dir)
+}
+
+func TestPlaceMovesUploads(t *testing.T) {
+	src, dir := t.TempDir(), t.TempDir()
+	model, weights := filepath.Join(src, "model"), filepath.Join(src, "weights")
+	os.WriteFile(model, []byte{0x08, 0x01}, 0o600) //nolint:errcheck
+	os.WriteFile(weights, []byte("w"), 0o600)      //nolint:errcheck
+	if err := Place(ONNX, model, weights, "", dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{model, weights} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s still exists after Place; uploads should be moved, not copied", p)
+		}
+	}
+	if err := Place(ONNX, filepath.Join(src, "missing"), "", "", dir); err == nil {
+		t.Error("missing model file accepted")
+	}
+	empty := filepath.Join(src, "empty")
+	os.WriteFile(empty, nil, 0o600) //nolint:errcheck
+	if err := Place(ONNX, empty, "", "", dir); !isFormatErr(err) {
+		t.Errorf("empty model err = %v, want FormatError", err)
+	}
+}
+
 func isFormatErr(err error) bool {
 	var fe *FormatError
 	return errors.As(err, &fe)
@@ -52,7 +93,7 @@ var hfGood = []entry{
 
 func TestONNX(t *testing.T) {
 	dir := t.TempDir()
-	if err := Place(ONNX, []byte{0x08, 0x0a, 0x12}, []byte("w"), nil, dir); err != nil {
+	if err := place(t, ONNX, []byte{0x08, 0x0a, 0x12}, []byte("w"), nil, dir); err != nil {
 		t.Fatal(err)
 	}
 	for _, f := range []string{"model.onnx", "model.onnx.data"} {
@@ -60,14 +101,14 @@ func TestONNX(t *testing.T) {
 			t.Fatalf("%s not written", f)
 		}
 	}
-	if err := Place(ONNX, []byte("PK\x03\x04 a zip"), nil, nil, t.TempDir()); !isFormatErr(err) {
+	if err := place(t, ONNX, []byte("PK\x03\x04 a zip"), nil, nil, t.TempDir()); !isFormatErr(err) {
 		t.Fatalf("non-ONNX accepted: %v", err)
 	}
 }
 
 func TestInputSpec(t *testing.T) {
 	dir := t.TempDir()
-	if err := Place(ONNX, []byte{0x08, 0x0a}, nil, []byte(`{"input_size": [224, 224]}`), dir); err != nil {
+	if err := place(t, ONNX, []byte{0x08, 0x0a}, nil, []byte(`{"input_size": [224, 224]}`), dir); err != nil {
 		t.Fatal(err)
 	}
 	if raw, _ := os.ReadFile(filepath.Join(dir, "input_spec.json")); string(raw) != `{"input_size": [224, 224]}` {
@@ -84,7 +125,7 @@ func TestInputSpec(t *testing.T) {
 		"too large":         {ONNX, []byte{0x08}, []byte(`{"x": "` + strings.Repeat("a", 70<<10) + `"}`)},
 	}
 	for name, c := range cases {
-		if err := Place(c.format, c.model, nil, c.spec, t.TempDir()); !isFormatErr(err) {
+		if err := place(t, c.format, c.model, nil, c.spec, t.TempDir()); !isFormatErr(err) {
 			t.Errorf("%s: err = %v, want FormatError", name, err)
 		}
 	}
@@ -92,7 +133,7 @@ func TestInputSpec(t *testing.T) {
 
 func TestWeightsOnlyForONNX(t *testing.T) {
 	ts := makeZip(t, entry{name: "m/code/__torch__.py"}, entry{name: "m/constants.pkl"}, entry{name: "m/extra/tanuh.json"})
-	if err := Place(TorchScript, ts, []byte("w"), nil, t.TempDir()); !isFormatErr(err) {
+	if err := place(t, TorchScript, ts, []byte("w"), nil, t.TempDir()); !isFormatErr(err) {
 		t.Fatalf("weights with TorchScript accepted: %v", err)
 	}
 }
@@ -110,7 +151,7 @@ func TestTorchScript(t *testing.T) {
 	}
 	for name, c := range accepted {
 		dir := t.TempDir()
-		if err := Place(TorchScript, c.model, nil, c.spec, dir); err != nil {
+		if err := place(t, TorchScript, c.model, nil, c.spec, dir); err != nil {
 			t.Errorf("%s: %v", name, err)
 		} else if _, err := os.Stat(filepath.Join(dir, "model.pt")); err != nil {
 			t.Errorf("%s: model.pt not written", name)
@@ -122,7 +163,7 @@ func TestTorchScript(t *testing.T) {
 		"not a zip (raw pickle)": []byte("\x80\x02pickle"),
 	}
 	for name, data := range rejected {
-		if err := Place(TorchScript, data, nil, nil, t.TempDir()); !isFormatErr(err) {
+		if err := place(t, TorchScript, data, nil, nil, t.TempDir()); !isFormatErr(err) {
 			t.Errorf("%s: err = %v, want FormatError", name, err)
 		}
 	}
@@ -132,7 +173,7 @@ func TestTorchScript(t *testing.T) {
 func extracted(t *testing.T, data []byte) map[string]string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := Place(HuggingFace, data, nil, nil, dir); err != nil {
+	if err := place(t, HuggingFace, data, nil, nil, dir); err != nil {
 		t.Fatal(err)
 	}
 	out := map[string]string{}
@@ -218,17 +259,17 @@ func TestHuggingFaceRejects(t *testing.T) {
 		"bad config JSON":     makeZip(t, entry{name: "config.json", body: `{`}, hfGood[1], hfGood[2]),
 	}
 	for name, data := range cases {
-		if err := Place(HuggingFace, data, nil, nil, t.TempDir()); !isFormatErr(err) {
+		if err := place(t, HuggingFace, data, nil, nil, t.TempDir()); !isFormatErr(err) {
 			t.Errorf("%s: err = %v, want FormatError", name, err)
 		}
 	}
-	if err := Place(HuggingFace, makeZip(t, hfGood...), []byte("w"), nil, t.TempDir()); !isFormatErr(err) {
+	if err := place(t, HuggingFace, makeZip(t, hfGood...), []byte("w"), nil, t.TempDir()); !isFormatErr(err) {
 		t.Errorf("weights with HF accepted: %v", err)
 	}
 }
 
 func TestUnknownFormat(t *testing.T) {
-	if err := Place("keras", []byte("x"), nil, nil, t.TempDir()); !isFormatErr(err) {
+	if err := place(t, "keras", []byte("x"), nil, nil, t.TempDir()); !isFormatErr(err) {
 		t.Fatalf("unknown format accepted: %v", err)
 	}
 }

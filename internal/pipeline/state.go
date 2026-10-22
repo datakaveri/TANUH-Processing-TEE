@@ -72,6 +72,11 @@ func (m *Manager) secureJobsDir() string { return filepath.Join(m.workflowDir(),
 func (m *Manager) jobDir(jobID string) string {
 	return filepath.Join(m.secureJobsDir(), jobID)
 }
+
+// receivedDir holds a job's decrypted uploads until materialize places them.
+func (m *Manager) receivedDir(jobID string) string {
+	return filepath.Join(m.jobDir(jobID), "received")
+}
 func (m *Manager) statePath() string {
 	return filepath.Join(m.runtimeDir(), "secure_runtime_state.json")
 }

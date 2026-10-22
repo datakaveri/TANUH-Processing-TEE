@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -55,9 +54,12 @@ func main() {
 	mgr.StartIdleDeallocator(ctx)
 
 	httpSrv := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           server.New(rs, mgr, filepath.Join(cfg.WorkflowDir(), "incoming"), ctx),
-		TLSConfig:         rs.TLSConfig(),
+		Addr:      cfg.ListenAddr,
+		Handler:   server.New(rs, mgr, ctx),
+		TLSConfig: rs.TLSConfig(),
+		// /api/load-model replaces these with an idle deadline that moves
+		// while the payload keeps arriving (server.readIdleTimeout), so a
+		// large model is not cut off at 10 minutes.
 		ReadTimeout:       10 * time.Minute,
 		WriteTimeout:      10 * time.Minute,
 		IdleTimeout:       60 * time.Second,

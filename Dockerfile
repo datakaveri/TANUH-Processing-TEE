@@ -37,6 +37,10 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
     LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib
 
+# Soft memory target for the Go process only (intake streams a couple of
+# chunks at a time); the Python stages ignore it.
+ENV GOMEMLIMIT=1GiB
+
 WORKDIR /app
 
 # python3.11 from deadsnakes to match the prior runtime (3.11) on Ubuntu 22.04,

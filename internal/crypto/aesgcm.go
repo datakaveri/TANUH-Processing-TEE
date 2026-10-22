@@ -1,5 +1,7 @@
 // Package crypto decrypts TANUH datasets: the tanuh-enc-dataset-v1 format the
-// UI writes (see dataset_v1.go and ui-dx encrypted-dataset-upload.ts).
+// UI writes (see dataset_v1.go and ui-dx encrypted-dataset-upload.ts), and
+// model uploads in the AES-256-GCM-CHUNKED-v1 format the Buffer TEE forwards
+// (see chunked.go).
 package crypto
 
 import (
