@@ -333,24 +333,32 @@ def to_tensor(img_rgb, spec):
 
 # ── runtimes ───────────────────────────────────────────────────────────────────
 
-def load_onnx_model_bytes(model_path, weights_path):
-    """Serialize a self-contained model, pointing every external tensor at the
-    uploaded weights file whatever name the exporter recorded."""
+RESOLVED_ONNX = "model.resolved.onnx"
+
+
+def resolve_onnx_model(model_path, weights_path):
+    """The path ONNX Runtime loads. A model with external weights is rewritten
+    so every external tensor points at the uploaded weights file, whatever name
+    the exporter recorded (and nothing outside it), and saved next to that file;
+    ONNX Runtime then reads the weights itself. Loading from a path, not from
+    serialized bytes, is what allows models over protobuf's 2 GB limit, and it
+    keeps no second in-memory copy of the weights."""
     import onnx
-    from onnx.external_data_helper import _get_all_tensors, load_external_data_for_model
+    from onnx.external_data_helper import _get_all_tensors
     model = onnx.load(str(model_path), load_external_data=False)
     ext = [t for t in _get_all_tensors(model)
            if t.HasField("data_location") and t.data_location == onnx.TensorProto.EXTERNAL]
     if not ext:
-        return model_path.read_bytes()
+        return model_path
     if weights_path is None or not weights_path.exists():
         raise ModelError("the ONNX model declares external weights but no weights file was uploaded")
     for t in ext:
         for entry in t.external_data:
             if entry.key == "location":
                 entry.value = weights_path.name
-    load_external_data_for_model(model, str(weights_path.parent))
-    return model.SerializeToString()
+    resolved = weights_path.parent / RESOLVED_ONNX
+    onnx.save(model, str(resolved))
+    return resolved
 
 
 class OnnxRuntime:
@@ -363,11 +371,11 @@ class OnnxRuntime:
             raise ModelError("model.onnx not found")
         weights = model_dir / "model.onnx.data"
         try:
-            model_bytes = load_onnx_model_bytes(model_path, weights if weights.exists() else None)
+            path = resolve_onnx_model(model_path, weights if weights.exists() else None)
             available = set(ort.get_available_providers())
             providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available] \
                 or ["CPUExecutionProvider"]
-            self.session = ort.InferenceSession(model_bytes, providers=providers)
+            self.session = ort.InferenceSession(str(path), providers=providers)
         except ModelError:
             raise
         except Exception as exc:

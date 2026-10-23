@@ -112,6 +112,31 @@ class OnnxSpec(unittest.TestCase):
         (self.dir / "other_name.data").rename(self.dir / "model.onnx.data")
         self.assertEqual(self.load().spec.height, 8)
 
+    def test_external_weights_load_from_path_and_stay_inside(self):
+        # The exporter's recorded location points outside the model folder: it is
+        # rewritten to the uploaded weights file, and the model runs from its path.
+        w = helper.make_tensor("w", TensorProto.FLOAT, [1, 3, 1, 1], np.array([1, 2, 3], np.float32).tobytes(),
+                               raw=True)
+        x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["b", 3, 8, 8])
+        y = helper.make_tensor_value_info("y", TensorProto.FLOAT, None)
+        g = helper.make_graph([helper.make_node("Mul", ["x", "w"], ["y"])], "g", [x], [y], [w])
+        m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 18)])
+        m.ir_version = 10
+        onnx.save_model(m, str(self.dir / "model.onnx"), save_as_external_data=True,
+                        location="exported.data", size_threshold=0)
+        (self.dir / "exported.data").rename(self.dir / "model.onnx.data")
+        tampered = onnx.load(str(self.dir / "model.onnx"), load_external_data=False)
+        for e in tampered.graph.initializer[0].external_data:
+            if e.key == "location":
+                e.value = "../../etc/passwd"
+        onnx.save(tampered, str(self.dir / "model.onnx"))
+        rt = self.load()
+        resolved = onnx.load(str(self.dir / infer.RESOLVED_ONNX), load_external_data=False)
+        locations = [e.value for e in resolved.graph.initializer[0].external_data if e.key == "location"]
+        self.assertEqual(locations, ["model.onnx.data"])
+        out = rt.run(np.ones((1, 3, 8, 8), np.float32))["y"]
+        np.testing.assert_allclose(out[0, :, 0, 0], [1, 2, 3])
+
     def test_garbage_file_is_a_model_error(self):
         (self.dir / "model.onnx").write_bytes(b"not an onnx model")
         with self.assertRaises(infer.ModelError):
