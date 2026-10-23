@@ -30,7 +30,7 @@ safetensors==0.8.0
 pydicom==3.0.2
 pylibjpeg[all]==2.1.0
 opencv-python-headless==4.11.0.86
-Pillow==12.3.0
+Pillow==13.0.0
 # Convenient for adaptors. Anything else an adaptor imports is installed at
 # job time by dep_scanner.py + uv (network policy allows pypi download-only).
 pandas>=2.0.0,<3
