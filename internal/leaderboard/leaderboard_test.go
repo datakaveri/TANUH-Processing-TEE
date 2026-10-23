@@ -193,6 +193,31 @@ func TestForLeaderboardDetectionKeys(t *testing.T) {
 	}
 }
 
+// Every metric key the UI offers for bounding_box (and Renal Health's entry,
+// which uses some aliases) maps onto the detection evaluator's output.
+func TestForLeaderboardEveryUIBoundingBoxKey(t *testing.T) {
+	eval := map[string]any{}
+	for i, k := range []string{"map", "ap50", "ap75", "map_giou", "precision_50", "recall_50", "f1_50", "precision_75",
+		"recall_75", "f1_75", "mean_iou", "median_iou", "p25_iou", "mean_giou", "detection_rate", "avg_boxes_per_image"} {
+		eval[k] = float64(i) / 100
+	}
+	ui := []string{"map_50_95", "map_50_95_giou", "ap_50", "ap_75", "precision_50", "recall_50", "f1_50", "precision_75",
+		"recall_75", "f1_75", "detection_rate", "avg_boxes_per_image", "mean_iou_all_images", "median_iou_all_images",
+		"p25_iou_all_images", "mean_giou_all_images",
+		"giou_matched_map_50_95", "mean_iou"} // Renal Health
+	required := map[string]catalogue.MetricSpec{}
+	for _, k := range ui {
+		required[k] = catalogue.MetricSpec{Name: k, Max: 1}
+	}
+	got, err := ForLeaderboard(eval, required)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(ui) || got["map_50_95_giou"] != eval["map_giou"] || got["mean_iou_all_images"] != eval["mean_iou"] {
+		t.Fatalf("got %v", got)
+	}
+}
+
 func TestForLeaderboardWithoutRequirementsSendsFlatMetrics(t *testing.T) {
 	got, err := ForLeaderboard(evalMetrics(t, "multiclass_bcd"), nil)
 	if err != nil {

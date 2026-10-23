@@ -124,7 +124,7 @@ func Read(name string, data []byte) (*Table, error) {
 var (
 	idNames = []string{"file", "filename", "file_name", "filepath", "file_path", "path", "relative_path",
 		"image", "image_id", "image_name", "image_path", "image_file", "img", "img_id", "img_name",
-		"dicom", "dicom_file", "sample", "sample_id", "case_id", "unique_case_id", "case", "subject",
+		"dicom", "dicom_file", "dicom_path", "dcm_path", "dcm_file", "sample", "sample_id", "case_id", "unique_case_id", "case", "subject",
 		"subject_id", "folder", "folder_id", "id", "name", "uid"}
 	idHints    = []string{"file", "path", "image", "img", "dicom", "case", "subject", "folder", "sample", "id", "name"}
 	labelNames = []string{"label", "labels", "class", "class_id", "class_label", "class_name", "category",

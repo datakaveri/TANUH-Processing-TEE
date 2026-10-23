@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reference adaptor for object_detection: per-image detector outputs -> box rows.
+Reference adaptor for bounding_box (object detection): per-image detector outputs -> box rows.
 
 The Processing TEE runs a detection job's inference with --per-sample, then the
 model provider's adaptor as

@@ -98,3 +98,35 @@ func TestWriteCanonicalBoxes(t *testing.T) {
 		t.Fatalf("%q", raw)
 	}
 }
+
+// Renal Health's benchmark_ground_truth.csv (columns from its Croissant
+// card): the image is named by dcm_path, which carries an extra leading
+// folder; image_width must not be taken for the file column; one class and
+// no class column.
+func TestBoxesRenalHealthLayout(t *testing.T) {
+	files := []string{
+		"automated_labels_benchmarking/RHV_0040_RIGHT/RHV_0040_RIGHT.dcm",
+		"manual_annotation_finalized/RHV_0042_LEFT/RHV_0042_LEFT.dcm",
+	}
+	gt := "patient_id,side,hospital,source,dcm_path,image_width,image_height,xmin,ymin,xmax,ymax,depth_cm,cone_angle_deg\n" +
+		"RHV_0040,RIGHT,Hosp4,automated,Benchmarking_Confirmed/automated_labels_benchmarking/RHV_0040_RIGHT/RHV_0040_RIGHT.dcm,860,725,191.5,194.6,610.6,412.8,19.4,55.0\n" +
+		"RHV_0042,LEFT,Hosp4,manual,Benchmarking_Confirmed/manual_annotation_finalized/RHV_0042_LEFT/RHV_0042_LEFT.dcm,900,700,100,120,500,400,,62.8\n"
+	tab, err := ReadBoxes("benchmark_ground_truth.csv", []byte(gt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tab.IDColumn != "dcm_path" || tab.LabelColumn != "" {
+		t.Fatalf("id column %q, label column %q", tab.IDColumn, tab.LabelColumn)
+	}
+	res, err := MatchBoxes(tab, []string{"kidney"}, files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]Box{
+		files[0]: {{X1: 191.5, Y1: 194.6, X2: 610.6, Y2: 412.8}},
+		files[1]: {{X1: 100, Y1: 120, X2: 500, Y2: 400}},
+	}
+	if !reflect.DeepEqual(res.Boxes, want) || res.MatchedBy["path_suffix"] != 2 {
+		t.Fatalf("boxes %v, matched by %v", res.Boxes, res.MatchedBy)
+	}
+}

@@ -63,9 +63,10 @@ var (
 	boxY  = []string{"y", "bbox_y", "box_y"}
 	boxW  = []string{"w", "width", "bbox_w", "bbox_width", "box_w", "box_width"}
 	boxH  = []string{"h", "height", "bbox_h", "bbox_height", "box_h", "box_height"}
-	// Box columns win over these when picking the file and class columns.
-	boxIDNames = []string{"file", "filename", "file_name", "filepath", "file_path", "path", "image", "image_id",
-		"image_name", "image_path", "img", "id", "name", "sample", "sample_id", "case_id"}
+	// Box columns win over these when picking the file and class columns. The
+	// file column takes the same exact names as classification (idNames), but
+	// no substring hints: "image" would pick e.g. image_width.
+	boxIDNames    = idNames
 	boxClassNames = []string{"class", "label", "category", "class_id", "category_id", "class_name", "category_name",
 		"class_index", "label_id", "cls", "target"}
 )

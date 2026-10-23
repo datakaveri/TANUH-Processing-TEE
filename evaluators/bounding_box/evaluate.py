@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bucket evaluator: object_detection (2D axis-aligned bounding boxes).
+Bucket evaluator: bounding_box (2D axis-aligned bounding boxes).
 
 Scores a model's predicted boxes against a dataset's ground-truth boxes. Owned
 by the platform; one script serves every detection dataset. It never touches
@@ -36,10 +36,22 @@ classes that have at least one ground-truth box:
   ap50, ap75   AP at IoU 0.50 / 0.75
   map_giou     as map, but a detection matches a ground-truth box by Generalized
                IoU >= threshold instead of IoU
-  recall_50    recall at IoU 0.50 with all (up to 100) detections
+  precision_50, recall_50, f1_50   at IoU 0.50, counting all (up to 100 per image
+               and class) detections: precision = matched / predicted boxes, recall =
+               matched / ground-truth boxes, F1 their harmonic mean (per class, then
+               averaged); no score threshold, so low-confidence boxes count
+  precision_75, recall_75, f1_75   the same at IoU 0.75
   mean_iou     for every ground-truth box, the best IoU with a same-class
                prediction in its image (0 if none), averaged over all boxes
-  per_class    ap / ap50 / ap75 / recall_50 / ground-truth and predicted box counts
+  median_iou, p25_iou   median and 25th percentile of those best IoUs
+  mean_giou    as mean_iou with Generalized IoU (-1 if none; range -1..1)
+  detection_rate        share of images with at least one ground-truth box that
+               have at least one predicted box (any class, any position)
+  avg_boxes_per_image   predicted boxes per image (not in [0, 1])
+  per_class    ap / ap50 / ap75 / precision, recall and f1 at 0.50 / box counts
+
+Not computed: efficiency (FPS, GMACs) — it depends on the hardware, not on
+the predictions.
 
 Exit codes:
   0   results.json written
@@ -77,7 +89,8 @@ def log(msg):
 # ── reading tables leniently (same helpers as the other bucket evaluators) ──────
 
 FILE_COLUMNS = ("file", "filename", "file_name", "filepath", "file_path", "path", "image", "image_id",
-                "image_name", "image_path", "img", "id", "ids", "sample", "sample_id", "case_id", "name")
+                "image_name", "image_path", "img", "id", "ids", "sample", "sample_id", "case_id", "case",
+                "dcm_path", "dicom_path", "name")
 X1 = ("x_min", "xmin", "x1", "left", "x0", "bbox_x_min", "box_x_min")
 Y1 = ("y_min", "ymin", "y1", "top", "y0", "bbox_y_min", "box_y_min")
 X2 = ("x_max", "xmax", "x2", "right", "bbox_x_max", "box_x_max")
@@ -266,7 +279,7 @@ def interpolated_ap(tp, scores, num_gt):
 
 
 def class_scores(gt, preds, c, generalized):
-    """AP per threshold, recall@0.5, and (num_gt, num_pred) for class c."""
+    """AP per threshold, matched-box counts per threshold, and (num_gt, num_pred) for class c."""
     num_gt = sum(sum(1 for b in boxes if b[5] == c) for boxes in gt.values())
     tps = {t: [] for t in IOU_THRESHOLDS}
     scores = []
@@ -290,21 +303,29 @@ def class_scores(gt, preds, c, generalized):
                     taken[best_j] = True
                 tps[t].append(1 if best_j >= 0 else 0)
     aps = {t: interpolated_ap(tps[t], scores, num_gt) for t in IOU_THRESHOLDS}
-    recall50 = (sum(tps[0.5]) / num_gt) if num_gt else None
-    return aps, recall50, num_gt, num_pred
+    matched = {t: int(sum(tps[t])) for t in IOU_THRESHOLDS}
+    return aps, matched, num_gt, num_pred
 
 
-def mean_best_iou(gt, preds):
+def prf(matched, num_gt, num_pred):
+    """Precision, recall and F1 from box counts (precision 0 with no predictions)."""
+    p = matched / num_pred if num_pred else 0.0
+    r = matched / num_gt
+    return p, r, (2 * p * r / (p + r) if p + r else 0.0)
+
+
+def best_overlaps(gt, preds, generalized, none):
+    """For every ground-truth box, the best (G)IoU with a same-class prediction in its image."""
     best = []
     for f, boxes in gt.items():
         for b in boxes:
             same = [p[:4] for p in preds.get(f, []) if p[5] == b[5]]
-            best.append(float(pairwise_iou([b[:4]], same).max()) if same else 0.0)
-    return float(np.mean(best)) if best else 0.0
+            best.append(float(pairwise_iou([b[:4]], same, generalized).max()) if same else none)
+    return np.asarray(best, dtype=np.float64)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="object_detection bucket evaluator")
+    ap = argparse.ArgumentParser(description="bounding_box bucket evaluator")
     ap.add_argument("--predictions", required=True)
     ap.add_argument("--ground-truth", required=True)
     ap.add_argument("--spec", required=True)
@@ -314,7 +335,7 @@ def main():
     spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
     class_names = spec.get("class_names") or []
     if not class_names:
-        raise ValueError("object_detection needs at least 1 class name")
+        raise ValueError("bounding_box needs at least 1 class name")
 
     gt, _ = read_boxes(args.ground_truth, class_names, ValueError, need_score=False)
     if not gt:
@@ -344,32 +365,49 @@ def main():
         log("WARNING: predicted boxes are all within [0, 1] but ground-truth boxes are in pixels; "
             "the adaptor must write original-image pixel coordinates")
 
-    per_class, aps, aps_giou, recalls = {}, [], [], []
+    per_class, aps, aps_giou, at50, at75 = {}, [], [], [], []
     for c, name in enumerate(class_names):
-        a, r50, n_gt, n_pred = class_scores(gt, preds, c, generalized=False)
+        a, matched, n_gt, n_pred = class_scores(gt, preds, c, generalized=False)
         ag, _, _, _ = class_scores(gt, preds, c, generalized=True)
         per_class[name] = {"num_gt": n_gt, "num_pred": n_pred}
         if n_gt == 0:  # COCO: a class with no ground truth is left out of the means
-            per_class[name].update({"ap": None, "ap50": None, "ap75": None, "recall_50": None})
+            per_class[name].update({k: None for k in ("ap", "ap50", "ap75", "precision_50", "recall_50", "f1_50")})
             continue
         m = float(np.mean([a[t] for t in IOU_THRESHOLDS]))
-        per_class[name].update({"ap": m, "ap50": a[0.5], "ap75": a[0.75], "recall_50": r50})
+        p50, r50, f50 = prf(matched[0.5], n_gt, n_pred)
+        per_class[name].update({"ap": m, "ap50": a[0.5], "ap75": a[0.75],
+                                "precision_50": p50, "recall_50": r50, "f1_50": f50})
         aps.append((m, a[0.5], a[0.75]))
         aps_giou.append(float(np.mean([ag[t] for t in IOU_THRESHOLDS])))
-        recalls.append(r50)
+        at50.append((p50, r50, f50))
+        at75.append(prf(matched[0.75], n_gt, n_pred))
     if not aps:
         raise ValueError("the ground truth has no boxes of any class")
+    ious = best_overlaps(gt, preds, generalized=False, none=0.0)
+    gious = best_overlaps(gt, preds, generalized=True, none=-1.0)
+    with_objects = [f for f, boxes in gt.items() if boxes]
+    mean = lambda rows, i: float(np.mean([r[i] for r in rows]))
     metrics = {
         "map": float(np.mean([x[0] for x in aps])),
         "ap50": float(np.mean([x[1] for x in aps])),
         "ap75": float(np.mean([x[2] for x in aps])),
         "map_giou": float(np.mean(aps_giou)),
-        "recall_50": float(np.mean(recalls)),
-        "mean_iou": mean_best_iou(gt, preds),
+        "precision_50": mean(at50, 0),
+        "recall_50": mean(at50, 1),
+        "f1_50": mean(at50, 2),
+        "precision_75": mean(at75, 0),
+        "recall_75": mean(at75, 1),
+        "f1_75": mean(at75, 2),
+        "mean_iou": float(ious.mean()),
+        "median_iou": float(np.median(ious)),
+        "p25_iou": float(np.percentile(ious, 25)),
+        "mean_giou": float(gious.mean()),
+        "detection_rate": sum(1 for f in with_objects if preds.get(f)) / len(with_objects),
+        "avg_boxes_per_image": sum(len(b) for b in preds.values()) / len(gt),
     }
     result = {
         "status": "success",
-        "task_type": "object_detection",
+        "task_type": "bounding_box",
         "num_samples": len(gt),
         "num_gt_boxes": sum(len(b) for b in gt.values()),
         "num_pred_boxes": sum(len(b) for b in preds.values()),

@@ -104,7 +104,7 @@ func (s Spec) Validate() error {
 		return fmt.Errorf("catalogue: the dataset has no problemStatement (problem bucket, e.g. binary_classification)")
 	}
 	min := 2 // classification and segmentation (background + 1)
-	if s.TaskType == "object_detection" {
+	if s.TaskType == "bounding_box" {
 		min = 1 // no background class: a single object type is a valid detection task
 	}
 	if len(s.ClassNames) < min {

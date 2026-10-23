@@ -36,7 +36,7 @@ const (
 )
 
 // bucketKinds lists the buckets whose ground truth is not a class per sample.
-var bucketKinds = map[string]gtKind{"segmentation": gtMask, "object_detection": gtBox}
+var bucketKinds = map[string]gtKind{"segmentation": gtMask, "bounding_box": gtBox}
 
 func kindOf(bucket string) gtKind {
 	if k, ok := bucketKinds[bucket]; ok {

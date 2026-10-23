@@ -168,7 +168,7 @@ func TestParseItemAndValidate(t *testing.T) {
 		t.Fatal("empty result accepted")
 	}
 	// Detection has no background class: one class is enough; classification needs 2.
-	if err := (Spec{TaskType: "object_detection", ClassNames: []string{"kidney"}}).Validate(); err != nil {
+	if err := (Spec{TaskType: "bounding_box", ClassNames: []string{"kidney"}}).Validate(); err != nil {
 		t.Fatalf("single-class detection: %v", err)
 	}
 	if err := (Spec{TaskType: "binary_classification", ClassNames: []string{"x"}}).Validate(); err == nil {

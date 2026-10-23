@@ -413,7 +413,7 @@ class SegmentationEvaluator(unittest.TestCase):
 
 # ── object detection ─────────────────────────────────────────────────────────────
 
-DET = HERE / "object_detection" / "evaluate.py"
+DET = HERE / "bounding_box" / "evaluate.py"
 GT_HDR = ["file", "x_min", "y_min", "x_max", "y_max", "class"]
 PRED_HDR = ["file", "x_min", "y_min", "x_max", "y_max", "score", "class"]
 
@@ -448,6 +448,31 @@ class DetectionEvaluator(unittest.TestCase):
             self.assertAlmostEqual(res["metrics"][k], 1.0, msg=k)
         self.assertEqual(res["num_samples"], 3)
         self.assertEqual(res["num_gt_boxes"], 2)
+        self.assertEqual(res["task_type"], "bounding_box")
+
+    def test_counting_metrics(self):
+        # a: found exactly, plus a far-away false positive; b: missed; c: no objects.
+        preds = [["a.png", 10, 10, 110, 110, 0.9, 0], ["a.png", 300, 300, 340, 340, 0.3, 0]]
+        code, res, out = run_det(DET_GT, PRED_HDR, preds, KIDNEY)
+        self.assertEqual(code, 0, out)
+        m = res["metrics"]
+        for k in ("precision_50", "recall_50", "f1_50", "precision_75", "recall_75", "f1_75"):
+            self.assertAlmostEqual(m[k], 0.5, msg=k)  # 1 matched of 2 predicted, of 2 true
+        self.assertAlmostEqual(m["detection_rate"], 0.5)          # a of {a, b}; c has no objects
+        self.assertAlmostEqual(m["avg_boxes_per_image"], 2 / 3)
+        self.assertAlmostEqual(m["mean_iou"], 0.5)                # best IoUs [1, 0]
+        self.assertAlmostEqual(m["median_iou"], 0.5)
+        self.assertAlmostEqual(m["p25_iou"], 0.25)
+        self.assertAlmostEqual(m["mean_giou"], 0.0)               # best GIoUs [1, -1]
+        self.assertAlmostEqual(res["per_class"]["kidney"]["f1_50"], 0.5)
+
+    def test_renal_health_output_columns(self):
+        # Renal Health's card: case, xmin, ymin, xmax, ymax, confidence; one class, no class column.
+        preds = [["a", 10, 10, 110, 110, 0.9], ["b", 50, 50, 150, 100, 0.8]]
+        code, res, out = run_det(DET_GT, ["case", "xmin", "ymin", "xmax", "ymax", "confidence"], preds, KIDNEY)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(res["predictions_format"]["file_column"], "case")
+        self.assertAlmostEqual(res["metrics"]["map"], 1.0)
 
     def test_iou_thresholds(self):
         # a: 100x100 box shifted by 12 px -> IoU = 88*100 / (2*10000 - 8800) = 0.7857:

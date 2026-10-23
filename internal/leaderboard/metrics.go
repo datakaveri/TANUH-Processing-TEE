@@ -27,14 +27,24 @@ var metricAliases = map[string][]string{
 	// segmentation
 	"dice": {"dice_score", "dice_coefficient", "mean_dice"},
 	"iou":  {"iou_score", "jaccard", "jaccard_index", "mean_iou"},
-	// object detection (catalogue keys are slugs of names like "mAP@[0.5:0.95]" -> map_0_5_0_95).
-	// The detection evaluator reports mean_iou itself, and an identity match wins over the
-	// segmentation alias above.
-	"map":       {"map_0_5_0_95", "map_50_95", "map_0_50_0_95", "mean_average_precision", "coco_map"},
-	"ap50":      {"ap_0_5", "ap_50", "ap_0_50", "map_0_5", "map_50", "map50"},
-	"ap75":      {"ap_0_75", "ap_75", "map_0_75", "map_75", "map75"},
-	"map_giou":  {"giou_matched_map_0_5_0_95", "giou_map", "map_giou_0_5_0_95", "giou_matched_map"},
-	"recall_50": {"recall_0_5", "ar_0_5", "ar50", "ar_50"},
+	// bounding_box (object detection): the UI's metric keys and their aliases
+	// (BOUNDING_BOX_METRICS in the UI's evaluator-metrics.util.ts), plus slugs of
+	// names like "mAP@[0.5:0.95]" -> map_0_5_0_95. The detection evaluator reports
+	// mean_iou itself, and an identity match wins over the segmentation alias above.
+	"map":          {"map_0_5_0_95", "map_50_95", "map_0_50_0_95", "mean_average_precision", "coco_map"},
+	"ap50":         {"ap_0_5", "ap_50", "ap_0_50", "map_0_5", "map_50", "map50"},
+	"ap75":         {"ap_0_75", "ap_75", "map_0_75", "map_75", "map75"},
+	"map_giou":     {"map_50_95_giou", "giou_matched_map_50_95", "giou_matched_map_0_5_0_95", "giou_map", "giou_map_50_95", "map_giou_0_5_0_95", "giou_matched_map"},
+	"precision_50": {"precision_0_5"},
+	"recall_50":    {"recall_0_5", "ar_0_5", "ar50", "ar_50"},
+	"f1_50":        {"f1_0_5"},
+	"precision_75": {"precision_0_75"},
+	"recall_75":    {"recall_0_75", "ar_0_75", "ar75", "ar_75"},
+	"f1_75":        {"f1_0_75"},
+	"mean_iou":     {"mean_iou_all_images"},
+	"median_iou":   {"median_iou_all_images"},
+	"p25_iou":      {"p25_iou_all_images"},
+	"mean_giou":    {"mean_giou_all_images"},
 }
 
 var aliasToStandard = func() map[string]string {
